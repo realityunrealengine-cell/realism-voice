@@ -9,6 +9,7 @@ import { STATUS_LABEL, type PresenceStatus } from '@/lib/types';
 import { StatusDot } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
 import { CallTimer } from '@/components/voice/CallTimer';
+import { UpdatesButton } from '@/components/settings/UpdatesSection';
 import { toast } from '@/stores/ui';
 
 export const QUALITY: Record<ConnectionQuality, { label: string; color: string }> = {
@@ -106,6 +107,9 @@ export function UserPanel() {
   return (
     <div className="bg-black/25">
       <VoiceStatus />
+      <div className="border-b border-white/5 px-2 py-1">
+        <UpdatesButton />
+      </div>
       <div className="flex items-center gap-1 px-2 py-2">
         <button className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 text-left hover:bg-white/5" onClick={statusMenu}>
           <Avatar userId={profile.id} size={34} showStatus />

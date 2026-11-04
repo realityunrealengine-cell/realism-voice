@@ -1,5 +1,5 @@
 // Автообновление через electron-updater и GitHub Releases.
-// Обновление скачивается в фоне, но ставится только по явному действию пользователя и не во время звонка.
+// Проверка автоматическая. Скачивание и установка — только по кнопкам в интерфейсе, установка — не во время звонка.
 // Токены здесь не нужны: канал обновлений — публичный репозиторий, адрес берётся из resources/app-update.yml.
 import { app, net, powerMonitor } from 'electron';
 import fs from 'node:fs';
@@ -21,7 +21,7 @@ export interface UpdaterTestOptions {
   retryDelaysMs?: number[];
 }
 
-let firstCheckDelayMs = 30_000;
+let firstCheckDelayMs = 10_000;
 let retryDelaysMs = [30_000, 2 * 60_000, 5 * 60_000, 15 * 60_000];
 
 let updater: AppUpdater | null = null;
@@ -30,6 +30,8 @@ let publish: (state: UpdateState) => void = () => undefined;
 let busy = false; // идёт проверка или загрузка: параллельно не запускаем
 let inCall = false;
 let downloadedVersion: string | null = null;
+let verifiedVersion: string | null = null; // версия из последнего манифеста, прошедшего проверку подписи
+let requestedVersion: string | null = null; // пользователь нажал «Обновить»: при сбое загрузка повторяется
 let retryIndex = 0;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let intervalTimer: ReturnType<typeof setInterval> | null = null;
@@ -136,10 +138,44 @@ function scheduleRetry() {
   retryTimer = setTimeout(() => void checkForUpdates(false), delay);
 }
 
+function markNoUpdate() {
+  verifiedVersion = null;
+  requestedVersion = null;
+  downloadedVersion = null; // выпуск могли отозвать: загруженную ранее версию больше не предлагаем
+  retryIndex = 0;
+  patch({ phase: 'not-available', availableVersion: null, releaseNotes: null, progress: null, error: null, lastCheckedAt: Date.now(), nextRetryAt: null });
+}
+
+/** quiet — плановая проверка: сбой сети не меняет то, что уже показано пользователю */
+function handleFailure(err: unknown, quiet: boolean, hadDownload: boolean) {
+  const code = (err as { code?: string })?.code;
+  updater?.logger?.error(`Update failed: ${code ?? ''} ${err instanceof Error ? err.message : String(err)}`);
+  const stillReady = hadDownload && downloadedVersion !== null;
+  if (isRejectedSignature(code)) {
+    verifiedVersion = null;
+    requestedVersion = null;
+    if (stillReady) patch({ phase: 'downloaded', progress: null, error: errorText(err), nextRetryAt: null });
+    else patch({ phase: 'error', availableVersion: null, releaseNotes: null, progress: null, error: errorText(err), nextRetryAt: null });
+    return;
+  }
+  if (!quiet) patch({ phase: stillReady ? 'downloaded' : 'error', progress: null, error: errorText(err), nextRetryAt: null });
+  scheduleRetry();
+}
+
+async function performDownload(version: string) {
+  patch({ phase: 'downloading', progress: null, error: null, nextRetryAt: null });
+  // electron-updater сверяет SHA-512 из манифеста и подпись Windows (если она настроена); при ошибке файл удаляется
+  await updater?.downloadUpdate();
+  downloadedVersion = version;
+  requestedVersion = null;
+  retryIndex = 0;
+  patch({ phase: 'downloaded', progress: null, error: null, nextRetryAt: null });
+}
+
 export async function checkForUpdates(manual: boolean): Promise<void> {
   if (!updater || busy || state.phase === 'installing') return;
   clearRetry();
-  const keepReady = state.phase === 'downloaded' && !manual;
+  const quiet = !manual && (state.phase === 'downloaded' || state.phase === 'available');
   if (manual) retryIndex = 0;
   if (!net.isOnline()) {
     if (manual && state.phase !== 'downloaded') patch({ phase: 'error', error: 'Нет подключения к интернету.' });
@@ -148,41 +184,59 @@ export async function checkForUpdates(manual: boolean): Promise<void> {
   }
   const hadDownload = state.phase === 'downloaded';
   busy = true;
-  if (!keepReady) patch({ phase: 'checking', error: null, nextRetryAt: null });
+  if (!quiet) patch({ phase: 'checking', error: null, nextRetryAt: null });
   try {
     const result = await updater.checkForUpdates();
     if (!result?.isUpdateAvailable) {
-      // Выпуск могли отозвать: загруженную ранее версию больше не предлагаем
-      downloadedVersion = null;
-      retryIndex = 0;
-      patch({ phase: 'not-available', availableVersion: null, releaseNotes: null, progress: null, error: null, lastCheckedAt: Date.now(), nextRetryAt: null });
+      markNoUpdate();
       return;
     }
     const info = result.updateInfo;
-    // До любых действий с обновлением: неподписанный или изменённый манифест не показывается и не скачивается
+    // До любых действий с обновлением: неподписанный или изменённый манифест не показывается и не скачивается.
+    // electron-updater уже запомнил этот манифест, поэтому кнопка «Обновить» работает только при verifiedVersion
+    verifiedVersion = null;
     if (!verifyManifest(info as SignableManifest, publicKeys)) {
       throw Object.assign(new Error('Update manifest signature is invalid'), { code: MANIFEST_SIGNATURE_ERROR });
     }
+    verifiedVersion = info.version;
     patch({ availableVersion: info.version, releaseNotes: plainNotes(info), lastCheckedAt: Date.now() });
-    if (info.version !== downloadedVersion) {
-      downloadedVersion = null;
-      patch({ phase: 'downloading', progress: null, error: null, nextRetryAt: null });
-      // electron-updater сверяет SHA-512 из latest.yml и подпись (если она настроена); при ошибке файл удаляется
-      await updater.downloadUpdate();
-      downloadedVersion = info.version;
-    }
-    retryIndex = 0;
-    patch({ phase: 'downloaded', progress: null, error: null, nextRetryAt: null });
-  } catch (err) {
-    if (isNoReleases(err)) {
+    if (info.version === downloadedVersion) {
       retryIndex = 0;
-      patch({ phase: 'not-available', availableVersion: null, releaseNotes: null, progress: null, error: null, lastCheckedAt: Date.now(), nextRetryAt: null });
+      patch({ phase: 'downloaded', progress: null, error: null, nextRetryAt: null });
       return;
     }
-    const stillReady = hadDownload && downloadedVersion !== null;
-    updater.logger?.error(`Update failed: ${(err as { code?: string })?.code ?? ''} ${err instanceof Error ? err.message : String(err)}`);
-    patch({ phase: stillReady ? 'downloaded' : 'error', progress: null, error: errorText(err), nextRetryAt: null });
-    if (!isRejectedSignature((err as { code?: string })?.code)) scheduleRetry();
+    downloadedVersion = null;
+    if (info.version === requestedVersion) {
+      // Повтор после сбоя загрузки, начатой кнопкой «Обновить»
+      await performDownload(info.version);
+      return;
+    }
+    requestedVersion = null;
+    retryIndex = 0;
+    patch({ phase: 'available', progress: null, error: null, nextRetryAt: null });
+  } catch (err) {
+    if (isNoReleases(err)) {
+      markNoUpdate();
+      return;
+    }
+    handleFailure(err, quiet, hadDownload);
+  } finally {
+    busy = false;
+  }
+}
+
+/** Скачивание только по кнопке «Обновить» и только версии из манифеста, прошедшего проверку подписи */
+export async function startDownload(): Promise<void> {
+  if (!updater || busy || !verifiedVersion || verifiedVersion !== state.availableVersion) return;
+  if (state.phase !== 'available' && state.phase !== 'error') return;
+  clearRetry();
+  retryIndex = 0;
+  requestedVersion = verifiedVersion;
+  busy = true;
+  try {
+    await performDownload(verifiedVersion);
+  } catch (err) {
+    handleFailure(err, false, false);
   } finally {
     busy = false;
   }

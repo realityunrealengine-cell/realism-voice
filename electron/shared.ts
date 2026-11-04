@@ -31,7 +31,7 @@ export type DeepLink =
   | { type: 'auth'; action: 'callback' | 'reset'; code: string | null; error: string | null; errorDescription: string | null }
   | { type: 'invite'; code: string };
 
-export type UpdatePhase = 'disabled' | 'idle' | 'checking' | 'not-available' | 'downloading' | 'downloaded' | 'installing' | 'error';
+export type UpdatePhase = 'disabled' | 'idle' | 'checking' | 'not-available' | 'available' | 'downloading' | 'downloaded' | 'installing' | 'error';
 
 export interface UpdateProgress {
   percent: number;
@@ -89,6 +89,7 @@ export interface RvBridge {
   updates: {
     getState(): Promise<UpdateState | null>;
     check(): Promise<void>;
+    download(): Promise<void>;
     /** false — установка сейчас невозможна (идёт звонок или обновление не готово) */
     install(): Promise<boolean>;
     setInCall(inCall: boolean): void;

@@ -36,11 +36,14 @@ export function UpdateNotice() {
       setNotice(null);
       return;
     }
+    // В открытой панели уже есть кнопка установки, отдельная карточка там не нужна
+    const panelOpen = useUpdates.getState().panelOpen;
     if (announced.current !== version) {
       announced.current = version;
-      setNotice(inCall ? 'in-call' : 'ready');
+      if (inCall) setNotice('in-call');
+      else if (!panelOpen) setNotice('ready');
     } else if (callEnded) {
-      setNotice('ready');
+      setNotice(panelOpen ? null : 'ready');
     } else if (callStarted) {
       setNotice(null);
     }
@@ -70,11 +73,11 @@ export function UpdateNotice() {
             <div className="min-w-0 flex-1">
               {notice === 'ready' ? (
                 <>
-                  <div className="text-sm font-medium text-white">Обновление готово. Перезапустить Realism Voice?</div>
-                  <div className="mt-0.5 text-xs text-slate-400">Версия {version} загружена и проверена. Вход и настройки сохранятся.</div>
+                  <div className="text-sm font-medium text-white">Обновление скачано. Перезапустить Realism Voice?</div>
+                  <div className="mt-0.5 text-xs text-slate-400">Версия {version} скачана и проверена. Вход и настройки сохранятся.</div>
                   <div className="mt-3 flex gap-2">
                     <button className="btn-primary px-3 py-1.5 text-xs" onClick={() => void install()}>
-                      Обновить и перезапустить
+                      Перезапустить и установить
                     </button>
                     <button className="btn-ghost px-3 py-1.5 text-xs" onClick={() => setNotice(null)}>
                       Позже
@@ -83,8 +86,8 @@ export function UpdateNotice() {
                 </>
               ) : (
                 <>
-                  <div className="text-sm font-medium text-white">Обновление готово</div>
-                  <div className="mt-0.5 text-xs text-slate-400">Версия {version} загружена. Звонок не прервётся: перезапуск будет предложен после его завершения.</div>
+                  <div className="text-sm font-medium text-white">Обновление скачано</div>
+                  <div className="mt-0.5 text-xs text-slate-400">Версия {version} скачана. Звонок не прервётся: установка будет предложена после его завершения.</div>
                 </>
               )}
             </div>

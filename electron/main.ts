@@ -19,7 +19,7 @@ import type { AppSettings, DeepLink } from './shared';
 import { loadSettings, updateSettings } from './settings';
 import * as secureStore from './secureStore';
 import { globalPttAvailable, initPtt, setPttBinding, stopHook } from './ptt';
-import { checkForUpdates, getUpdateState, initUpdater, installUpdate, setInCall } from './updater';
+import { checkForUpdates, getUpdateState, initUpdater, installUpdate, setInCall, startDownload } from './updater';
 
 // Тестовая сборка обновлений ставится рядом с рабочей и не должна перехватывать её ссылки realismvoice://
 const IS_UPDATE_TEST_BUILD = app.getName() === 'Realism Voice Update Test';
@@ -484,8 +484,11 @@ function setupIpc() {
 
   ipcMain.handle('updates:get', (e) => (assertSender(e) ? getUpdateState() : null));
   ipcMain.handle('updates:check', (e) => {
-    // Не ждём: загрузка может идти долго, ход виден по событиям updates:state
     if (assertSender(e)) void checkForUpdates(true);
+  });
+  ipcMain.handle('updates:download', (e) => {
+    // Не ждём: загрузка может идти долго, ход виден по событиям updates:state
+    if (assertSender(e)) void startDownload();
   });
   ipcMain.handle('updates:install', (e) => assertSender(e) && installUpdate());
   ipcMain.on('updates:in-call', (e, inCall) => {

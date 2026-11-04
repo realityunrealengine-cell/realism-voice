@@ -3,14 +3,12 @@ import { LogoMark } from '@/components/ui/Logo';
 import { useVoice } from '@/stores/voice';
 import { useUpdates } from '@/stores/updates';
 import { CallTimer } from '@/components/voice/CallTimer';
-import { useInCall } from '@/components/ui/UpdateNotice';
 
 // Перетаскиваемая область окна. Справа — системные кнопки (titleBarOverlay Electron).
 export function TitleBar() {
   const status = useVoice((s) => s.status);
   const target = useVoice((s) => s.target);
-  const updateReady = useUpdates((s) => s.state?.phase === 'downloaded');
-  const inCall = useInCall();
+  const updatePhase = useUpdates((s) => s.state?.phase);
   return (
     <div className="drag-region relative z-40 flex h-9 shrink-0 items-center gap-2 bg-[#070912]/90 pl-3 pr-[150px]">
       <LogoMark size={18} />
@@ -26,12 +24,12 @@ export function TitleBar() {
           <CallTimer className="font-semibold" />
         </span>
       )}
-      {updateReady && (
+      {(updatePhase === 'available' || updatePhase === 'downloaded') && (
         <button
           className="no-drag ml-auto flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-300 hover:bg-emerald-500/25"
-          onClick={() => useUpdates.getState().setNotice(inCall ? 'in-call' : 'ready')}
+          onClick={() => useUpdates.getState().setPanelOpen(true)}
         >
-          <Download className="h-3 w-3" /> Обновление готово
+          <Download className="h-3 w-3" /> {updatePhase === 'available' ? 'Доступно обновление' : 'Обновление скачано'}
         </button>
       )}
     </div>

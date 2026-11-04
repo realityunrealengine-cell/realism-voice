@@ -3,6 +3,7 @@ import { X, LogOut } from 'lucide-react';
 import { useEffect } from 'react';
 import { useUi } from '@/stores/ui';
 import { useAuth } from '@/stores/auth';
+import { useUpdates } from '@/stores/updates';
 import { AccountSection, PrivacySection, ProfileSection } from './AccountSections';
 import { VoiceSection } from './VoiceSection';
 import { AboutSection, AppearanceSection, HotkeysSection, NotificationsSection, WindowsSection } from './AppSections';
@@ -38,7 +39,7 @@ export function SettingsView() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !useUi.getState().modal) close();
+      if (e.key === 'Escape' && !useUi.getState().modal && !useUpdates.getState().panelOpen) close();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);

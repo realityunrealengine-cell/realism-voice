@@ -44,6 +44,7 @@ const bridge: RvBridge = {
   updates: {
     getState: () => ipcRenderer.invoke('updates:get') as Promise<UpdateState | null>,
     check: () => ipcRenderer.invoke('updates:check') as Promise<void>,
+    download: () => ipcRenderer.invoke('updates:download') as Promise<void>,
     install: () => ipcRenderer.invoke('updates:install') as Promise<boolean>,
     setInCall: (inCall) => ipcRenderer.send('updates:in-call', inCall),
     onState: (cb) => subscribe<UpdateState>('updates:state', cb),

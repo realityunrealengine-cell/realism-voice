@@ -133,20 +133,44 @@ async function logicStage(electron) {
   await updater.checkForUpdates(true);
   ok(phase() === 'not-available', 'более старая версия на сервере не предлагается');
 
-  // Настоящий прогресс и защита от параллельных запусков
+  // Новая версия только показывается: скачивание начинается по кнопке
   feed.version = '1.0.4';
   feed.mode = 'slow';
   feed.notes = '<p>Исправлено <b>многое</b></p><script>alert(1)</script>&amp; ещё';
   feed.hits = { yml: 0, exe: 0 };
-  states.length = 0;
-  const first = updater.checkForUpdates(true);
+  const firstCheck = updater.checkForUpdates(true);
   for (let i = 0; i < 5; i++) void updater.checkForUpdates(true);
-  await until('downloading');
-  ok(updater.installUpdate() === false, 'во время загрузки установка невозможна');
-  for (let i = 0; i < 5; i++) void updater.checkForUpdates(true);
-  await first;
-  ok(phase() === 'downloaded', 'обновление загружено и проверено');
+  await firstCheck;
+  ok(phase() === 'available' && updater.getUpdateState().availableVersion === '1.0.4', 'новая версия найдена');
+  ok(feed.hits.exe === 0, 'без нажатия «Обновить» файл не скачивается');
   ok(feed.hits.yml === 1, 'одновременные проверки не дублируются', `запросов latest.yml: ${feed.hits.yml}`);
+  ok(updater.installUpdate() === false, 'до скачивания установка невозможна');
+  await updater.checkForUpdates(false);
+  ok(phase() === 'available' && feed.hits.exe === 0, 'плановая проверка не начинает скачивание');
+
+  // Плановая проверка при обрыве сети не убирает найденную версию
+  await close();
+  await updater.checkForUpdates(false);
+  ok(phase() === 'available', 'сбой сети при плановой проверке не меняет показанное состояние');
+  await listen();
+  await waitFor(() => updater.getUpdateState().nextRetryAt === null, 'повторная проверка');
+  await sleep(50);
+
+  // Настоящий прогресс, защита от параллельных запусков; скачивать можно и во время звонка
+  feed.hits = { yml: 0, exe: 0 };
+  states.length = 0;
+  updater.setInCall(true);
+  const first = updater.startDownload();
+  ok(phase() === 'downloading', 'скачивание идёт во время звонка');
+  for (let i = 0; i < 5; i++) {
+    void updater.startDownload();
+    void updater.checkForUpdates(true);
+  }
+  ok(updater.installUpdate() === false, 'во время загрузки установка невозможна');
+  await first;
+  updater.setInCall(false);
+  ok(phase() === 'downloaded', 'обновление загружено и проверено');
+  ok(feed.hits.yml === 0, 'во время загрузки проверки не запускаются', `запросов latest.yml: ${feed.hits.yml}`);
   ok(feed.hits.exe === 1, 'одновременные загрузки не дублируются', `запросов файла: ${feed.hits.exe}`);
   const progress = states.map((s) => s.progress).filter(Boolean);
   ok(progress.length > 1 && progress.every((p, i) => i === 0 || p.transferred >= progress[i - 1].transferred), 'прогресс настоящий и растёт', `событий: ${progress.length}`);
@@ -170,6 +194,8 @@ async function logicStage(electron) {
   feed.mode = 'corrupt';
   feed.hits.exe = 0;
   await updater.checkForUpdates(true);
+  ok(phase() === 'available', 'более новая версия заменила показанную');
+  await updater.startDownload();
   ok(phase() === 'error', 'повреждённый файл отклонён', updater.getUpdateState().error);
   ok(updater.installUpdate() === false, 'повреждённый файл нельзя установить');
   const pending = path.join(process.env.LOCALAPPDATA, cacheName, 'pending');
@@ -182,7 +208,8 @@ async function logicStage(electron) {
   feed.version = '1.0.6';
   feed.mode = 'drop';
   feed.hits.exe = 0;
-  const dropped = updater.checkForUpdates(true);
+  await updater.checkForUpdates(true);
+  const dropped = updater.startDownload();
   await waitFor(() => feed.hits.exe >= 1 && phase() !== 'downloading', 'обрыв загрузки');
   feed.mode = 'ok';
   await dropped;
@@ -215,6 +242,7 @@ async function logicStage(electron) {
     feed.tamper = tamper;
     feed.signWith = tamper ? signingKeys.privateKey : foreignKeys.privateKey;
     await updater.checkForUpdates(true);
+    await updater.startDownload();
     const s = updater.getUpdateState();
     ok(s.phase === 'error' && feed.hits.exe === 0 && s.nextRetryAt === null && s.availableVersion === null && updater.installUpdate() === false, `манифест отклонён: ${name}`, s.error);
   }
@@ -223,12 +251,24 @@ async function logicStage(electron) {
   feed.notes = 'Описание версии';
   feed.hits.exe = 0;
   await updater.checkForUpdates(true);
-  ok(phase() === 'downloaded' && feed.hits.exe === 1, 'исправно подписанный манифест принят', `version ${updater.getUpdateState().availableVersion}`);
+  ok(phase() === 'available' && feed.hits.exe === 0, 'исправно подписанный манифест принят', `version ${updater.getUpdateState().availableVersion}`);
+
+  // Подмена между показом версии и нажатием «Обновить»: electron-updater уже запомнил поддельный манифест
+  feed.tamper = (d) => { d.files[0].url = 'evil.exe'; };
+  await updater.checkForUpdates(false);
+  await updater.startDownload();
+  ok(phase() === 'error' && feed.hits.exe === 0 && updater.getUpdateState().availableVersion === null, 'кнопка «Обновить» не скачивает манифест, подменённый после показа версии');
+  feed.tamper = null;
+  await updater.checkForUpdates(true);
+  await updater.startDownload();
+  ok(phase() === 'downloaded' && feed.hits.exe === 1, 'после исправной проверки скачивание снова работает');
   feed.version = '1.0.8';
   feed.tamper = (d) => delete d.rvSignature;
   await updater.checkForUpdates(true);
   ok(phase() === 'downloaded' && updater.getUpdateState().availableVersion === '1.0.7', 'подменённый манифест не отменяет уже проверенное обновление');
   feed.tamper = null;
+  await updater.checkForUpdates(true);
+  ok(phase() === 'available' && updater.getUpdateState().availableVersion === '1.0.8' && updater.installUpdate() === false, 'новая версия заменяет скачанную старую: установка недоступна до скачивания');
 
   await close();
   fs.rmSync(path.join(process.env.LOCALAPPDATA, cacheName), { recursive: true, force: true });
@@ -245,8 +285,10 @@ async function installStage(electron, installDir) {
   const updater = require(path.join(asar, 'dist-electron', 'updater.js'));
   await updater.initUpdater(() => undefined, { configPath: path.join(installDir, 'resources', 'app-update.yml'), firstCheckDelayMs: 3_600_000 });
   await updater.checkForUpdates(true);
+  ok(updater.getUpdateState().phase === 'available', 'установленная 1.0.3 нашла 1.0.4 и ждёт кнопку «Обновить»', updater.getUpdateState().error ?? '');
+  await updater.startDownload();
   const state = updater.getUpdateState();
-  ok(state.phase === 'downloaded', 'установленная 1.0.3 нашла и загрузила 1.0.4', `${state.phase} ${state.error ?? ''}`);
+  ok(state.phase === 'downloaded', 'по кнопке 1.0.4 скачана и проверена', `${state.phase} ${state.error ?? ''}`);
   ok(state.availableVersion === '1.0.4', 'доступная версия определена верно');
   ok(state.releaseNotes?.includes('Тестовая версия 1.0.4'), 'описание изменений получено из latest.yml');
   ok(fs.readFileSync(path.join(root, 'release-test', '1.0.4', 'latest.yml'), 'utf8').includes('rvSignature:'), 'манифест подписан; ключ взят из package.json внутри установленной версии');
@@ -309,6 +351,8 @@ async function bootStage(electron, installDir, mode) {
   const state = await waitFor(() => exec('window.rv.updates.getState()'), 'ответ IPC');
   ok(state.phase === 'disabled' && state.disabledReason === 'dev', 'main.js запустился, IPC и preload обновлений работают', JSON.stringify({ phase: state.phase, reason: state.disabledReason }));
   ok((await exec('window.rv.updates.install()')) === false, 'запрос установки без готового обновления отклонён');
+  await exec('window.rv.updates.download()');
+  ok((await exec('window.rv.updates.getState()')).phase === 'disabled', 'запрос скачивания без проверенного манифеста ничего не запускает');
   await exec('window.rv.updates.setInCall(true)');
   await waitFor(() => exec('document.querySelector("#root")?.childElementCount > 0'), 'отрисовка интерфейса');
   ok(true, 'интерфейс установленной сборки отрисовался');

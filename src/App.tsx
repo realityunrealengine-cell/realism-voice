@@ -14,6 +14,7 @@ import { TitleBar } from '@/components/layout/TitleBar';
 import { LogoMark } from '@/components/ui/Logo';
 import { ContextMenu, Toasts } from '@/components/ui/Overlays';
 import { UpdateNotice } from '@/components/ui/UpdateNotice';
+import { UpdatesModal } from '@/components/settings/UpdatesSection';
 
 let pendingInvite: string | null = null;
 
@@ -136,6 +137,7 @@ export default function App() {
         </motion.div>
       </AnimatePresence>
       <ContextMenu />
+      <UpdatesModal />
       <UpdateNotice />
       <Toasts />
     </div>
