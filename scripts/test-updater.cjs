@@ -16,6 +16,12 @@ const CACHE_DIR = path.join(process.env.LOCALAPPDATA ?? '', 'realism-voice-updat
 const USER_DATA = path.join(process.env.APPDATA ?? '', APP_NAME);
 const INSTALLER = (v) => path.join(root, 'release-test', v, `RealismVoice-UpdateTest-${v}-Setup.exe`);
 const STAGE_TMP = path.join(os.tmpdir(), 'rv-updater-stage'); // удаляет родительский процесс: Electron держит файлы до выхода
+const PERSIST = {
+  key: 'rv-update-persist-test',
+  secure: 'значение сессии',
+  prefs: JSON.stringify({ microphone: 'тест', volume: 73 }),
+  settings: { closeToTray: false, hotkeys: { toggleMute: 'Ctrl+Alt+K' }, ptt: { code: 'KeyV', label: 'V' } },
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let failed = 0;
@@ -252,11 +258,13 @@ async function installStage(electron, installDir) {
 }
 
 // ---------- Настоящий main.js со скрытым окном (внутри Electron) ----------
-async function bootStage(electron, installDir) {
+// mode: boot — проверка IPC; boot-write и boot-read — данные пользователя через настоящие main.js и preload до и после обновления
+async function bootStage(electron, installDir, mode) {
   const Module = require('node:module');
-  const { app, BrowserWindow } = electron;
-  app.setName(APP_NAME); // main.js не трогает ссылки realismvoice:// в тестовой сборке
-  app.setPath('userData', STAGE_TMP);
+  const { app, BrowserWindow, session } = electron;
+  app.setName(APP_NAME);
+  app.setAsDefaultProtocolClient = () => true; // ссылки realismvoice:// остаются за рабочей версией
+  app.setPath('userData', mode === 'boot' ? STAGE_TMP : USER_DATA);
   let win = null;
   class HiddenWindow extends BrowserWindow {
     constructor(options) {
@@ -281,6 +289,23 @@ async function bootStage(electron, installDir) {
   await app.whenReady();
   await waitFor(() => win && !win.webContents.isLoading(), 'загрузка интерфейса');
   const exec = (code) => win.webContents.executeJavaScript(code);
+  if (mode === 'boot-write') {
+    await exec(`window.rv.storage.setItem(${JSON.stringify(PERSIST.key)}, ${JSON.stringify(PERSIST.secure)})`);
+    await exec(`window.rv.app.setSettings(${JSON.stringify(PERSIST.settings)})`);
+    await exec(`localStorage.setItem(${JSON.stringify(PERSIST.key)}, ${JSON.stringify(PERSIST.prefs)})`);
+    session.defaultSession.flushStorageData();
+    await sleep(1500);
+    ok(fs.existsSync(path.join(USER_DATA, 'session.bin')), `версия ${JSON.parse(fs.readFileSync(path.join(installDir, 'resources', 'app.asar', 'package.json'))).version}: записаны зашифрованная сессия, настройки и локальные предпочтения`, await exec('location.origin'));
+    return;
+  }
+  if (mode === 'boot-read') {
+    const version = JSON.parse(fs.readFileSync(path.join(installDir, 'resources', 'app.asar', 'package.json'))).version;
+    ok((await exec(`window.rv.storage.getItem(${JSON.stringify(PERSIST.key)})`)) === PERSIST.secure, `версия ${version}: зашифрованная сессия расшифрована (DPAPI)`);
+    const settings = await exec('window.rv.app.getSettings()');
+    ok(settings.hotkeys.toggleMute === PERSIST.settings.hotkeys.toggleMute && settings.ptt?.code === PERSIST.settings.ptt.code && settings.closeToTray === PERSIST.settings.closeToTray, `версия ${version}: настройки и горячие клавиши сохранились`);
+    ok((await exec(`localStorage.getItem(${JSON.stringify(PERSIST.key)})`)) === PERSIST.prefs, `версия ${version}: предпочтения (микрофон, громкость) сохранились`, await exec('location.origin'));
+    return;
+  }
   const state = await waitFor(() => exec('window.rv.updates.getState()'), 'ответ IPC');
   ok(state.phase === 'disabled' && state.disabledReason === 'dev', 'main.js запустился, IPC и preload обновлений работают', JSON.stringify({ phase: state.phase, reason: state.disabledReason }));
   ok((await exec('window.rv.updates.install()')) === false, 'запрос установки без готового обновления отклонён');
@@ -303,8 +328,10 @@ function runElectron(stage, arg) {
   });
 }
 
-function asarVersion(asar) {
-  return JSON.parse(require('@electron/asar').extractFile(asar, 'package.json').toString()).version;
+function asarVersion(asarPath) {
+  const asar = require('@electron/asar');
+  asar.uncache(asarPath); // заголовок кэшируется, а файл после обновления другой
+  return JSON.parse(asar.extractFile(asarPath, 'package.json').toString()).version;
 }
 
 function runInstaller(file, args) {
@@ -340,7 +367,7 @@ async function orchestrate() {
   const before = { exe: fileHash(realExe), protocol: protocolHandler() };
   const installDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rv-install-')), 'app');
   const asar = path.join(installDir, 'resources', 'app.asar');
-  const sentinels = ['settings.json', 'session.bin', path.join('Local Storage', 'leveldb', 'prefs.ldb')].map((f) => path.join(USER_DATA, f));
+  const sentinels = ['sentinel.txt', path.join('Local Storage', 'sentinel.txt')].map((f) => path.join(USER_DATA, f));
   const { createFeedServer } = require('./update-feed-server.cjs');
   const dirs = ['1.0.4', '1.0.3'].map((v) => path.join(root, 'release-test', v));
   const hits = [];
@@ -360,6 +387,7 @@ async function orchestrate() {
     }
 
     if ((await runElectron('boot', installDir)) !== 0) failed++;
+    if ((await runElectron('boot-write', installDir)) !== 0) failed++;
     console.log('');
     if ((await runElectron('install', installDir)) !== 0) failed++;
     const installed = await waitFor(() => {
@@ -371,6 +399,7 @@ async function orchestrate() {
     ok(hits.some((h) => h.endsWith('1.0.3-Setup.exe.blockmap')) || fs.existsSync(path.join(CACHE_DIR, 'current.blockmap')), 'использованы блок-карты для дифференциальной загрузки', hits.filter((h) => h.endsWith('.blockmap')).join(', '));
     const log = path.join(USER_DATA, 'logs', 'updater.log');
     ok(sentinels.every((f) => fs.existsSync(f) && fs.readFileSync(f, 'utf8').startsWith('данные пользователя')), 'данные пользователя в userData сохранились');
+    if ((await runElectron('boot-read', installDir)) !== 0) failed++;
     ok(!fs.existsSync(log) || !/token/i.test(fs.readFileSync(log, 'utf8')), 'журнал обновлений не содержит токенов');
     if (fs.existsSync(log)) {
       const lines = fs.readFileSync(log, 'utf8').split('\n').filter((l) => /differentially|block maps|Full:|File has|downloaded to/i.test(l));
@@ -399,7 +428,7 @@ if (stageIndex !== -1) {
   electron.app.on('window-all-closed', () => {});
   // Неожиданный выход не должен выглядеть как успех: штатно завершается только этап установки
   if (stage !== 'install') electron.app.on('before-quit', () => electron.app.exit(3));
-  const run = stage === 'logic' ? logicStage(electron) : stage === 'install' ? installStage(electron, arg) : bootStage(electron, arg);
+  const run = stage === 'logic' ? logicStage(electron) : stage === 'install' ? installStage(electron, arg) : bootStage(electron, arg, stage);
   run.then(
     () => electron.app.exit(failed === 0 ? 0 : 1),
     (err) => {
