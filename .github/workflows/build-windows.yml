@@ -1,6 +1,6 @@
-name: Build Windows installer
+name: Dry run (build without release)
 
-# Ручная сборка без публикации. Выпуск версии — в release.yml.
+# Пробная сборка вручную: проверяет секреты, сборку и подпись манифеста. Релиз не создаётся, в репозиторий обновлений ничего не пишется.
 on:
   workflow_dispatch:
 
@@ -18,6 +18,25 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Check release settings
+        run: node scripts/check-release.mjs pre
+        env:
+          HAS_SIGNING_CERT: ${{ secrets.CSC_LINK != '' }}
+          HAS_RELEASES_TOKEN: ${{ secrets.RELEASES_GH_TOKEN != '' }}
+          HAS_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
+          ALLOW_UNSIGNED_UPDATES: ${{ vars.ALLOW_UNSIGNED_UPDATES }}
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+
+      # Только чтение: токен должен иметь право записи в репозиторий обновлений
+      - name: Check release token access
+        run: |
+          $repo = node scripts/check-release.mjs repo
+          $push = gh api "repos/$repo" --jq .permissions.push
+          if ($push -ne 'true') { Write-Output "::error::RELEASES_GH_TOKEN не имеет права записи в $repo"; exit 1 }
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
+
       - name: Install dependencies
         run: npm ci
 
@@ -34,8 +53,19 @@ jobs:
           VITE_ENABLE_GOOGLE_AUTH: ${{ vars.VITE_ENABLE_GOOGLE_AUTH }}
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
+      - name: Sign update manifest
+        run: node scripts/sign-update-manifest.mjs release/latest.yml
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+
+      - name: Verify update metadata
+        run: node scripts/check-release.mjs post
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: RealismVoice-Setup
-          path: release/RealismVoice-Setup.exe
+          path: |
+            release/RealismVoice-Setup.exe
+            release/RealismVoice-Setup.exe.blockmap
+            release/latest.yml
           if-no-files-found: error

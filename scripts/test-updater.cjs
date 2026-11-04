@@ -43,8 +43,14 @@ async function logicStage(electron) {
   app.setPath('userData', path.join(tmp, 'userData'));
   const cacheName = `rv-updater-test-${process.pid}`;
   const body = crypto.randomBytes(6 * 1024 * 1024);
+  const yaml = require('js-yaml');
+  const { canonicalManifest } = require(path.join(root, 'dist-electron', 'updateManifest.js'));
+  const signingKeys = crypto.generateKeyPairSync('ed25519');
+  const foreignKeys = crypto.generateKeyPairSync('ed25519');
+  const publicKey = signingKeys.publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
 
-  const feed = { version: '1.0.3', mode: 'ok', notes: 'null', hits: { yml: 0, exe: 0 } };
+  // tamper — подмена манифеста после подписи, signWith — чужой ключ
+  const feed = { version: '1.0.3', mode: 'ok', notes: null, hits: { yml: 0, exe: 0 }, tamper: null, signWith: signingKeys.privateKey };
   // У каждой версии своё содержимое: файл с той же суммой electron-updater законно берёт из кэша
   const versionPayload = () => {
     const unique = Buffer.from(body);
@@ -56,7 +62,11 @@ async function logicStage(electron) {
     if (req.url.startsWith('/latest.yml')) {
       feed.hits.yml++;
       const sha512 = crypto.createHash('sha512').update(payload).digest('base64');
-      res.end(`version: ${feed.version}\nfiles:\n  - url: app-${feed.version}.exe\n    sha512: ${sha512}\n    size: ${payload.length}\npath: app-${feed.version}.exe\nsha512: ${sha512}\nreleaseDate: '2026-11-04T00:00:00.000Z'\nreleaseNotes: ${feed.notes}\n`);
+      const url = `app-${feed.version}.exe`;
+      const doc = { version: feed.version, files: [{ url, sha512, size: payload.length }], path: url, sha512, releaseDate: '2026-11-04T00:00:00.000Z', releaseNotes: feed.notes };
+      doc.rvSignature = crypto.sign(null, Buffer.from(canonicalManifest(doc)), feed.signWith).toString('base64');
+      feed.tamper?.(doc);
+      res.end(yaml.dump(doc));
       return;
     }
     if (req.url.includes('.exe') && !req.url.includes('.blockmap')) {
@@ -95,7 +105,7 @@ async function logicStage(electron) {
   await app.whenReady();
   const updater = require(path.join(root, 'dist-electron', 'updater.js'));
   const states = [];
-  await updater.initUpdater((s) => states.push(s), { configPath, firstCheckDelayMs: 3_600_000, retryDelaysMs: [300, 300, 300] });
+  await updater.initUpdater((s) => states.push(s), { configPath, publicKeys: [publicKey], firstCheckDelayMs: 3_600_000, retryDelaysMs: [300, 300, 300] });
   const { autoUpdater } = require('electron-updater');
   const phase = () => updater.getUpdateState().phase;
   const until = (p) => waitFor(() => phase() === p, `состояние ${p}`);
@@ -120,7 +130,7 @@ async function logicStage(electron) {
   // Настоящий прогресс и защита от параллельных запусков
   feed.version = '1.0.4';
   feed.mode = 'slow';
-  feed.notes = "'<p>Исправлено <b>многое</b></p><script>alert(1)</script>&amp; ещё'";
+  feed.notes = '<p>Исправлено <b>многое</b></p><script>alert(1)</script>&amp; ещё';
   feed.hits = { yml: 0, exe: 0 };
   states.length = 0;
   const first = updater.checkForUpdates(true);
@@ -178,6 +188,42 @@ async function logicStage(electron) {
   await updater.checkForUpdates(true);
   ok(phase() === 'not-available' && updater.installUpdate() === false, 'отозванный выпуск больше не предлагается');
 
+  // Подпись манифеста: ни один из подменённых манифестов не должен дойти до скачивания файла
+  feed.version = '1.0.7';
+  const attacks = [
+    ['нет подписи', (d) => delete d.rvSignature],
+    ['подпись испорчена', (d) => { d.rvSignature = Buffer.alloc(64, 7).toString('base64'); }],
+    ['чужой ключ', null],
+    ['подменён SHA-512', (d) => { d.files[0].sha512 = crypto.randomBytes(64).toString('base64'); }],
+    ['подменён файл', (d) => { d.files[0].url = 'evil.exe'; }],
+    ['подменён размер', (d) => { d.files[0].size += 1; }],
+    ['добавлен второй файл', (d) => { d.files.unshift({ url: 'evil.exe', sha512: 'AAAA', size: 1 }); }],
+    ['подменена версия', (d) => { d.version = '1.0.8'; }],
+    ['изменено описание', (d) => { d.releaseNotes = 'Срочно установите с evil.example'; }],
+    ['запрос прав администратора', (d) => { d.isAdminRightsRequired = true; }],
+    ['веб-установщик', (d) => { d.packages = { x64: { path: 'evil.7z', sha512: 'AAAA', size: 1 } }; }],
+    ['только устаревшие поля path и sha512', (d) => delete d.files],
+  ];
+  for (const [name, tamper] of attacks) {
+    feed.hits.exe = 0;
+    feed.tamper = tamper;
+    feed.signWith = tamper ? signingKeys.privateKey : foreignKeys.privateKey;
+    await updater.checkForUpdates(true);
+    const s = updater.getUpdateState();
+    ok(s.phase === 'error' && feed.hits.exe === 0 && s.nextRetryAt === null && s.availableVersion === null && updater.installUpdate() === false, `манифест отклонён: ${name}`, s.error);
+  }
+  feed.tamper = null;
+  feed.signWith = signingKeys.privateKey;
+  feed.notes = 'Описание версии';
+  feed.hits.exe = 0;
+  await updater.checkForUpdates(true);
+  ok(phase() === 'downloaded' && feed.hits.exe === 1, 'исправно подписанный манифест принят', `version ${updater.getUpdateState().availableVersion}`);
+  feed.version = '1.0.8';
+  feed.tamper = (d) => delete d.rvSignature;
+  await updater.checkForUpdates(true);
+  ok(phase() === 'downloaded' && updater.getUpdateState().availableVersion === '1.0.7', 'подменённый манифест не отменяет уже проверенное обновление');
+  feed.tamper = null;
+
   await close();
   fs.rmSync(path.join(process.env.LOCALAPPDATA, cacheName), { recursive: true, force: true });
 }
@@ -197,6 +243,7 @@ async function installStage(electron, installDir) {
   ok(state.phase === 'downloaded', 'установленная 1.0.3 нашла и загрузила 1.0.4', `${state.phase} ${state.error ?? ''}`);
   ok(state.availableVersion === '1.0.4', 'доступная версия определена верно');
   ok(state.releaseNotes?.includes('Тестовая версия 1.0.4'), 'описание изменений получено из latest.yml');
+  ok(fs.readFileSync(path.join(root, 'release-test', '1.0.4', 'latest.yml'), 'utf8').includes('rvSignature:'), 'манифест подписан; ключ взят из package.json внутри установленной версии');
   if (state.phase !== 'downloaded') return;
   // Отличие от настоящего запуска: без --force-run, чтобы не открывать окно приложения
   const { autoUpdater } = require(path.join(asar, 'node_modules', 'electron-updater'));

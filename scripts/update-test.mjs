@@ -2,7 +2,8 @@
 // У него свои appId, папка установки, userData и exe-файл, поэтому рабочая версия не затрагивается.
 //   build — собирает оба установщика в release-test/
 //   serve — раздаёт версию 1.0.4 с http://127.0.0.1:8484, откуда тестовая 1.0.3 получает обновление
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -15,15 +16,25 @@ const OLD_VERSION = '1.0.3';
 const NEW_VERSION = '1.0.4';
 const PORT = 8484;
 
+/** Свой ключ тестового приложения: боевой ключ подписи здесь не нужен */
+function testKey() {
+  const file = path.join(root, 'release-test', 'update-test-key.pem');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (!fs.existsSync(file)) fs.writeFileSync(file, crypto.generateKeyPairSync('ed25519').privateKey.export({ type: 'pkcs8', format: 'pem' }));
+  const pem = fs.readFileSync(file, 'utf8');
+  return { pem, publicKey: crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' }).toString('base64') };
+}
+
 async function buildVersion(version) {
   const { build, Platform, Arch } = require('electron-builder');
+  const key = testKey();
   const base = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).build;
   const config = {
     ...base,
     appId: 'com.realism.voice.updatetest',
     productName: NAME,
     directories: { output: `release-test/${version}`, buildResources: 'build' },
-    extraMetadata: { name: 'realism-voice-update-test', productName: NAME, version },
+    extraMetadata: { name: 'realism-voice-update-test', productName: NAME, version, updatePublicKeys: [key.publicKey] },
     publish: [{ provider: 'generic', url: `http://127.0.0.1:${PORT}/`, useMultipleRangeRequest: false }],
     releaseInfo: { releaseNotes: `Тестовая версия ${version}.\n- Проверка механизма обновлений.` },
     nsis: {
@@ -39,6 +50,10 @@ async function buildVersion(version) {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
   fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
   await build({ targets: Platform.WINDOWS.createTarget('nsis', Arch.x64), publish: 'never', config: configFile });
+  execFileSync(process.execPath, [path.join(root, 'scripts', 'sign-update-manifest.mjs'), path.join(root, 'release-test', version, 'latest.yml'), key.publicKey], {
+    env: { ...process.env, UPDATE_SIGNING_KEY: key.pem },
+    stdio: 'inherit',
+  });
 }
 
 const command = process.argv[2];

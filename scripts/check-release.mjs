@@ -1,24 +1,32 @@
 // Проверки конвейера публикации.
-//   pre <тег>  — перед сборкой: версия, канал обновлений, описание изменений, решение о подписи
-//   post       — после сборки: latest.yml соответствует установщику, в приложении нет токенов
-//   repo       — печатает owner/repo канала обновлений
+//   pre [тег]        — перед сборкой: канал, ключи, параметры Supabase, решение о сертификате; с тегом ещё версия и описание
+//   post             — после сборки: latest.yml подписан и соответствует установщику, в приложении нет токенов
+//   uploaded <файл>  — загруженный latest.yml совпадает с подписанным локальным
+//   repo             — печатает owner/repo канала обновлений
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 const channel = pkg.build.publish[0];
+const manifestFile = path.join(root, 'release', 'latest.yml');
 const errors = [];
 
 function pre(tag) {
-  if (tag !== `v${pkg.version}`) errors.push(`Тег ${tag} не совпадает с версией в package.json (${pkg.version}).`);
-  if (channel.owner.startsWith('REPLACE_')) errors.push('В package.json (build.publish[0].owner) не указан владелец GitHub-репозитория.');
-  const notes = path.join(root, 'build', 'release-notes.md');
-  if (!fs.existsSync(notes) || !fs.readFileSync(notes, 'utf8').includes(pkg.version)) {
-    errors.push(`В build/release-notes.md нет описания версии ${pkg.version}.`);
+  if (tag) {
+    if (tag !== `v${pkg.version}`) errors.push(`Тег ${tag} не совпадает с версией в package.json (${pkg.version}).`);
+    const notes = path.join(root, 'build', 'release-notes.md');
+    if (!fs.existsSync(notes) || !fs.readFileSync(notes, 'utf8').includes(pkg.version)) {
+      errors.push(`В build/release-notes.md нет описания версии ${pkg.version}.`);
+    }
   }
+  if (channel.owner.startsWith('REPLACE_')) errors.push('В package.json (build.publish[0].owner) не указан владелец GitHub-репозитория.');
+  if (!pkg.updatePublicKeys?.length) errors.push('В package.json нет публичного ключа обновлений (updatePublicKeys).');
+  if (process.env.HAS_UPDATE_SIGNING_KEY !== 'true') errors.push('Не задан секрет UPDATE_SIGNING_KEY: подписать манифест обновления нечем.');
   if (process.env.HAS_RELEASES_TOKEN !== 'true') {
     errors.push(`Не задан секрет RELEASES_GH_TOKEN с правом записи в ${channel.owner}/${channel.repo}.`);
   }
@@ -30,7 +38,7 @@ function pre(tag) {
   }
   if (process.env.HAS_SIGNING_CERT !== 'true' && process.env.ALLOW_UNSIGNED_UPDATES !== 'true') {
     errors.push(
-      'Сертификат подписи не настроен. Без него обновления защищены только SHA-512 и HTTPS: взлом GitHub-аккаунта позволит разослать вредоносную версию. ' +
+      'Сертификат Windows не настроен. Манифест обновления защищён подписью Ed25519, но установщик не подписан для Windows и SmartScreen будет предупреждать при первой установке. ' +
         'Добавьте секреты CSC_LINK и CSC_KEY_PASSWORD либо осознанно задайте переменную репозитория ALLOW_UNSIGNED_UPDATES=true.',
     );
   }
@@ -38,9 +46,11 @@ function pre(tag) {
 
 function post() {
   const dir = path.join(root, 'release');
-  const yml = fs.readFileSync(path.join(dir, 'latest.yml'), 'utf8');
+  const yml = fs.readFileSync(manifestFile, 'utf8');
   const field = (name) => yml.match(new RegExp(`^${name}: (.+)$`, 'm'))?.[1]?.trim().replace(/^'|'$/g, '');
   if (field('version') !== pkg.version) errors.push(`latest.yml описывает версию ${field('version')}, ожидалась ${pkg.version}.`);
+  const { verifyManifest } = require(path.join(root, 'dist-electron', 'updateManifest.js'));
+  if (!verifyManifest(require('js-yaml').load(yml), pkg.updatePublicKeys ?? [])) errors.push('Подпись latest.yml отсутствует или не соответствует ключу в package.json.');
   const exe = path.join(dir, field('path'));
   const actual = crypto.createHash('sha512').update(fs.readFileSync(exe)).digest('base64');
   if (actual !== field('sha512')) errors.push('SHA-512 установщика не совпадает с latest.yml.');
@@ -50,11 +60,16 @@ function post() {
   if (!config.includes(`owner: ${channel.owner}`) || !config.includes(`repo: ${channel.repo}`)) errors.push('app-update.yml указывает не на тот репозиторий.');
 }
 
+function uploaded(file) {
+  if (!file || !fs.readFileSync(file).equals(fs.readFileSync(manifestFile))) errors.push('Загруженный latest.yml отличается от подписанного.');
+}
+
 const [command, arg] = process.argv.slice(2);
 if (command === 'pre') pre(arg);
 else if (command === 'post') post();
+else if (command === 'uploaded') uploaded(arg);
 else if (command === 'repo') console.log(`${channel.owner}/${channel.repo}`);
-else errors.push('Использование: check-release.mjs pre <тег> | post | repo');
+else errors.push('Использование: check-release.mjs pre [тег] | post | uploaded <файл> | repo');
 
 if (errors.length > 0) {
   for (const e of errors) console.error(`::error::${e}`);

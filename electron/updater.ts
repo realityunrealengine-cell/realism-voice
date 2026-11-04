@@ -6,14 +6,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { AppUpdater, Logger, ProgressInfo, UpdateInfo } from 'electron-updater';
 import type { UpdateState } from './shared';
+import { verifyManifest, type SignableManifest } from './updateManifest';
 
 const PLACEHOLDER_OWNER = 'REPLACE_WITH_GITHUB_OWNER';
+const MANIFEST_SIGNATURE_ERROR = 'ERR_RV_MANIFEST_SIGNATURE';
 const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const MAX_NOTES_LENGTH = 2000;
 const MAX_LOG_BYTES = 1024 * 1024;
 
 export interface UpdaterTestOptions {
   configPath: string;
+  publicKeys?: string[];
   firstCheckDelayMs?: number;
   retryDelaysMs?: number[];
 }
@@ -22,6 +25,7 @@ let firstCheckDelayMs = 30_000;
 let retryDelaysMs = [30_000, 2 * 60_000, 5 * 60_000, 15 * 60_000];
 
 let updater: AppUpdater | null = null;
+let publicKeys: string[] = [];
 let publish: (state: UpdateState) => void = () => undefined;
 let busy = false; // идёт проверка или загрузка: параллельно не запускаем
 let inCall = false;
@@ -85,10 +89,23 @@ function plainNotes(info: UpdateInfo): string | null {
   return text.slice(0, MAX_NOTES_LENGTH) || null;
 }
 
+function isRejectedSignature(code: string | undefined): boolean {
+  return code === 'ERR_UPDATER_INVALID_SIGNATURE' || code === MANIFEST_SIGNATURE_ERROR;
+}
+
+function readPinnedKeys(): string[] {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')) as { updatePublicKeys?: unknown };
+    return Array.isArray(pkg.updatePublicKeys) ? pkg.updatePublicKeys.filter((k): k is string => typeof k === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 function errorText(err: unknown): string {
   const code = (err as { code?: string })?.code ?? '';
   const message = err instanceof Error ? err.message : String(err);
-  if (code === 'ERR_UPDATER_INVALID_SIGNATURE') return 'Обновление отклонено: цифровая подпись не прошла проверку.';
+  if (isRejectedSignature(code)) return 'Обновление отклонено: цифровая подпись не прошла проверку.';
   if (code === 'ERR_CHECKSUM_MISMATCH' || /sha(2|512) checksum mismatch/i.test(message)) {
     return 'Загруженный файл повреждён и не будет установлен.';
   }
@@ -142,6 +159,10 @@ export async function checkForUpdates(manual: boolean): Promise<void> {
       return;
     }
     const info = result.updateInfo;
+    // До любых действий с обновлением: неподписанный или изменённый манифест не показывается и не скачивается
+    if (!verifyManifest(info as SignableManifest, publicKeys)) {
+      throw Object.assign(new Error('Update manifest signature is invalid'), { code: MANIFEST_SIGNATURE_ERROR });
+    }
     patch({ availableVersion: info.version, releaseNotes: plainNotes(info), lastCheckedAt: Date.now() });
     if (info.version !== downloadedVersion) {
       downloadedVersion = null;
@@ -159,8 +180,9 @@ export async function checkForUpdates(manual: boolean): Promise<void> {
       return;
     }
     const stillReady = hadDownload && downloadedVersion !== null;
-    patch({ phase: stillReady ? 'downloaded' : 'error', progress: null, error: errorText(err) });
-    if ((err as { code?: string })?.code !== 'ERR_UPDATER_INVALID_SIGNATURE') scheduleRetry();
+    updater.logger?.error(`Update failed: ${(err as { code?: string })?.code ?? ''} ${err instanceof Error ? err.message : String(err)}`);
+    patch({ phase: stillReady ? 'downloaded' : 'error', progress: null, error: errorText(err), nextRetryAt: null });
+    if (!isRejectedSignature((err as { code?: string })?.code)) scheduleRetry();
   } finally {
     busy = false;
   }
@@ -199,7 +221,9 @@ export async function initUpdater(onState: (state: UpdateState) => void, test?: 
     patch({ disabledReason: 'unconfigured' });
     return;
   }
-  if (config.includes(PLACEHOLDER_OWNER)) {
+  publicKeys = test?.publicKeys ?? readPinnedKeys();
+  // Без закреплённого ключа обновления не проверить, поэтому и не принимать
+  if (config.includes(PLACEHOLDER_OWNER) || publicKeys.length === 0) {
     patch({ disabledReason: 'unconfigured' });
     return;
   }

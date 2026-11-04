@@ -20,9 +20,52 @@
     "dist": "npm run build && electron-builder --win nsis --x64 --publish never",
     "pack": "npm run build && electron-builder --win dir --x64 --publish never",
     "test:updater": "node scripts/test-updater.cjs",
+    "update-key:generate": "node scripts/generate-update-key.mjs",
     "update-test:build": "node scripts/update-test.mjs build",
     "update-test:serve": "node scripts/update-test.mjs serve"
   },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.15",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@supabase/supabase-js": "^2.118.0",
+    "@types/node": "^22.20.5",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.6.2",
+    "concurrently": "^9.2.5",
+    "cross-env": "^7.0.3",
+    "electron": "^37.10.3",
+    "electron-builder": "^26.18.0",
+    "framer-motion": "^11.18.2",
+    "livekit-client": "^2.23.0",
+    "lucide-react": "^1.67.0",
+    "png-to-ico": "^3.0.2",
+    "postcss": "^8.5.32",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "sharp": "^0.35.5",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "wait-on": "^8.0.5",
+    "zustand": "^5.0.16"
+  },
+  "optionalDependencies": {
+    "uiohook-napi": "^1.5.5"
+  },
+  "allowScripts": {
+    "electron@37.10.3": true,
+    "esbuild@0.25.12": true,
+    "electron-winstaller@5.4.0": true,
+    "uiohook-napi": false
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11"
+  },
+  "updatePublicKeys": [
+    "MCowBQYDK2VwAyEAE2z6CeSolIZJMfKzOK6WSdSXbjK7CObk+bhHSRd90sA="
+  ],
   "build": {
     "appId": "com.realism.voice",
     "productName": "Realism Voice",
@@ -87,44 +130,5 @@
       "artifactName": "RealismVoice-Setup.exe",
       "language": "1049"
     }
-  },
-  "devDependencies": {
-    "@electric-sql/pglite": "^0.5.15",
-    "@fontsource-variable/inter": "^5.3.0",
-    "@supabase/supabase-js": "^2.118.0",
-    "@types/node": "^22.20.5",
-    "@types/react": "^18.3.31",
-    "@types/react-dom": "^18.3.7",
-    "@vitejs/plugin-react": "^4.7.0",
-    "autoprefixer": "^10.6.2",
-    "concurrently": "^9.2.5",
-    "cross-env": "^7.0.3",
-    "electron": "^37.10.3",
-    "electron-builder": "^26.18.0",
-    "framer-motion": "^11.18.2",
-    "livekit-client": "^2.23.0",
-    "lucide-react": "^1.67.0",
-    "png-to-ico": "^3.0.2",
-    "postcss": "^8.5.32",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "sharp": "^0.35.5",
-    "tailwindcss": "^3.4.19",
-    "typescript": "^5.9.3",
-    "vite": "^6.4.5",
-    "wait-on": "^8.0.5",
-    "zustand": "^5.0.16"
-  },
-  "optionalDependencies": {
-    "uiohook-napi": "^1.5.5"
-  },
-  "allowScripts": {
-    "electron@37.10.3": true,
-    "esbuild@0.25.12": true,
-    "electron-winstaller@5.4.0": true,
-    "uiohook-napi": false
-  },
-  "dependencies": {
-    "electron-updater": "6.8.11"
   }
 }

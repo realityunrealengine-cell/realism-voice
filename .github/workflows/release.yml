@@ -30,6 +30,7 @@ jobs:
         env:
           HAS_SIGNING_CERT: ${{ secrets.CSC_LINK != '' }}
           HAS_RELEASES_TOKEN: ${{ secrets.RELEASES_GH_TOKEN != '' }}
+          HAS_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
           ALLOW_UNSIGNED_UPDATES: ${{ vars.ALLOW_UNSIGNED_UPDATES }}
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
@@ -63,8 +64,24 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
 
+      - name: Sign update manifest
+        run: node scripts/sign-update-manifest.mjs release/latest.yml
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+
       - name: Verify update metadata
         run: node scripts/check-release.mjs post
+
+      - name: Upload signed manifest and verify it
+        run: |
+          $repo = node scripts/check-release.mjs repo
+          gh release upload "$env:GITHUB_REF_NAME" release/latest.yml --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release download "$env:GITHUB_REF_NAME" --repo $repo --pattern latest.yml --output uploaded-latest.yml --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/check-release.mjs uploaded uploaded-latest.yml
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
 
       - name: Publish release
         run: |
