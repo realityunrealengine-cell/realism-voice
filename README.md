@@ -162,9 +162,9 @@ Workflow `.github/workflows/build-windows.yml` собирает установщ
    npm version patch
    git push --follow-tags
    ```
-3. Workflow `.github/workflows/release.yml` проверит версию, TypeScript и RLS, соберёт установщик, загрузит файлы
-   в черновик релиза, подпишет `latest.yml`, сверит SHA-512 и подпись и опубликует релиз.
-   Пока идёт загрузка, пользователи обновление не видят.
+3. Workflow `.github/workflows/release.yml` проверит версию, TypeScript и RLS, соберёт установщик, подпишет `latest.yml`,
+   сверит SHA-512 и подпись, загрузит все три файла в один черновик, проверит его состав и только тогда опубликует релиз.
+   Пока идёт загрузка, пользователи обновление не видят. Уже опубликованный релиз workflow не меняет.
 
 Постоянная ссылка для новых пользователей:
 `https://github.com/realityunrealengine-cell/realism-voice-releases/releases/latest/download/RealismVoice-Setup.exe`.

@@ -1,7 +1,6 @@
 // Проверки конвейера публикации.
 //   pre [тег]        — перед сборкой: канал, ключи, параметры Supabase, решение о сертификате; с тегом ещё версия и описание
 //   post             — после сборки: latest.yml подписан и соответствует установщику, в приложении нет токенов
-//   uploaded <файл>  — загруженный latest.yml совпадает с подписанным локальным
 //   repo             — печатает owner/repo канала обновлений
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -60,16 +59,11 @@ function post() {
   if (!config.includes(`owner: ${channel.owner}`) || !config.includes(`repo: ${channel.repo}`)) errors.push('app-update.yml указывает не на тот репозиторий.');
 }
 
-function uploaded(file) {
-  if (!file || !fs.readFileSync(file).equals(fs.readFileSync(manifestFile))) errors.push('Загруженный latest.yml отличается от подписанного.');
-}
-
 const [command, arg] = process.argv.slice(2);
 if (command === 'pre') pre(arg);
 else if (command === 'post') post();
-else if (command === 'uploaded') uploaded(arg);
 else if (command === 'repo') console.log(`${channel.owner}/${channel.repo}`);
-else errors.push('Использование: check-release.mjs pre [тег] | post | uploaded <файл> | repo');
+else errors.push('Использование: check-release.mjs pre [тег] | post | repo');
 
 if (errors.length > 0) {
   for (const e of errors) console.error(`::error::${e}`);

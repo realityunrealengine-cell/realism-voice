@@ -20,6 +20,7 @@
     "dist": "npm run build && electron-builder --win nsis --x64 --publish never",
     "pack": "npm run build && electron-builder --win dir --x64 --publish never",
     "test:updater": "node scripts/test-updater.cjs",
+    "test:release": "node scripts/test-release-publish.mjs",
     "update-key:generate": "node scripts/generate-update-key.mjs",
     "update-test:build": "node scripts/update-test.mjs build",
     "update-test:serve": "node scripts/update-test.mjs serve"

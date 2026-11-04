@@ -1,7 +1,7 @@
 name: Release
 
 # Запускается тегом вида v1.0.3. Обновление становится видно пользователям только на последнем шаге:
-# до этого файлы лежат в черновике релиза, который electron-updater не видит.
+# файлы лежат в черновике релиза, пока не проверен их полный состав.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
@@ -55,11 +55,10 @@ jobs:
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_ENABLE_GOOGLE_AUTH: ${{ vars.VITE_ENABLE_GOOGLE_AUTH }}
 
-      # Создаёт установщик, latest.yml и .blockmap и загружает их в черновик релиза.
-      - name: Build installer and upload to draft release
-        run: npx electron-builder --win nsis --x64 --publish always
+      # Создаёт установщик, latest.yml и .blockmap. Загрузка — отдельным шагом: см. publish-release.mjs
+      - name: Build installer
+        run: npx electron-builder --win nsis --x64 --publish never
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
@@ -72,20 +71,7 @@ jobs:
       - name: Verify update metadata
         run: node scripts/check-release.mjs post
 
-      - name: Upload signed manifest and verify it
-        run: |
-          $repo = node scripts/check-release.mjs repo
-          gh release upload "$env:GITHUB_REF_NAME" release/latest.yml --repo $repo --clobber
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          gh release download "$env:GITHUB_REF_NAME" --repo $repo --pattern latest.yml --output uploaded-latest.yml --clobber
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/check-release.mjs uploaded uploaded-latest.yml
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
-
       - name: Publish release
-        run: |
-          $repo = node scripts/check-release.mjs repo
-          gh release edit "$env:GITHUB_REF_NAME" --repo $repo --draft=false --latest --title "Realism Voice $env:GITHUB_REF_NAME" --notes-file build/release-notes.md
+        run: node scripts/publish-release.mjs
         env:
           GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
