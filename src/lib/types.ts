@@ -15,7 +15,7 @@ export interface Profile {
   allow_friend_requests: boolean;
   accent_color: string | null;
   /** Значок задаётся только на сервере; поля нет, пока не применена миграция 0006 */
-  badge?: 'owner' | null;
+  badge?: 'owner' | 'tester' | null;
   /** Поля нет, пока не применена миграция 0007 */
   banner_path?: string | null;
   last_seen_at: string | null;

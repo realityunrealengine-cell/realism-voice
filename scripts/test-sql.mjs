@@ -235,5 +235,70 @@ await expectOk('A deletes own banner file', () => as(A, `delete from storage.obj
 eq('own banner file deleted', (await bannerObjects(A)).includes(`${A}/1-abc.webp`), false);
 await expectErr('badge still not editable next to banner', () => as(A, `update public.profiles set badge='owner', banner_path=null where id=$1`, [A]));
 
+// значок Tester
+const testerSql = fs.readFileSync(path.join(migDir, '20261104000003_tester_badge.sql'), 'utf8');
+const adminSql = fs.readFileSync(path.resolve(migDir, '..', 'admin', 'tester-badge.sql'), 'utf8');
+const statements = adminSql.split(/;\s*\n/).map((s) => s.replace(/--.*$/gm, '').trim()).filter(Boolean);
+const adminLookup = statements[0], adminGrant = statements[1], adminRevoke = statements[3];
+const fill = (sql, id) => sql.replace(/UUID_ДРУГА/g, id);
+eq('owner kept after tester migration', await badgeOf(D), 'owner');
+await expectErr('admin SQL with placeholder changes nothing', () => db.query(adminGrant));
+eq('admin lookup is read only', /^select\b/i.test(adminLookup) && !/\b(update|insert|delete)\b/i.test(adminLookup), true);
+const looked = (await db.query(adminLookup.replace('USERNAME_ДРУГА', 'NEW_USER_C'.toLowerCase()))).rows;
+eq('admin lookup with unknown username finds nothing', looked.length, 0);
+const nameOfA = (await db.query('select username from public.profiles where id=$1', [A])).rows[0].username;
+const foundA = (await db.query(adminLookup.replace('USERNAME_ДРУГА', nameOfA))).rows;
+eq('admin lookup finds exactly one account with its id and email', foundA.length === 1 && foundA[0].id === A && !!foundA[0].email, true);
+eq('admin grant is bound to id, not username', /where id = /.test(adminGrant) && !/username\s*=/.test(adminGrant.split('where')[1]), true);
+eq('admin grant returns the account', (await db.query(fill(adminGrant, A))).rows[0].username, (await db.query('select username from public.profiles where id=$1', [A])).rows[0].username);
+eq('tester badge granted', await badgeOf(A), 'tester');
+eq('several testers allowed', (await db.query(fill(adminGrant, B))).rows.length, 1);
+eq('admin grant cannot replace owner', (await db.query(fill(adminGrant, D))).rows.length, 0);
+eq('owner untouched by grant', await badgeOf(D), 'owner');
+eq('admin revoke cannot remove owner', (await db.query(fill(adminRevoke, D))).rows.length, 0);
+eq('owner untouched by revoke', await badgeOf(D), 'owner');
+eq('unknown id grants nothing', (await db.query(fill(adminGrant, '00000000-0000-4000-8000-0000000000ff'))).rows.length, 0);
+await expectErr('second owner rejected', () => db.exec(`update public.profiles set badge='owner' where id='${C}'`));
+await expectErr('unknown badge rejected', () => db.exec(`update public.profiles set badge='admin' where id='${C}'`));
+eq('tester visible to others', (await as(C, 'select badge from public.profiles where id=$1', [A])).rows[0].badge, 'tester');
+await expectOk('tester renames self', () => as(A, `update public.profiles set username='renamed_tester' where id=$1`, [A]));
+eq('tester survives rename', await badgeOf(A), 'tester');
+await expectErr('C cannot grant self tester', () => as(C, `update public.profiles set badge='tester' where id=$1`, [C]));
+await expectErr('C cannot grant self owner', () => as(C, `update public.profiles set badge='owner' where id=$1`, [C]));
+await expectErr('tester cannot promote self to owner', () => as(A, `update public.profiles set badge='owner' where id=$1`, [A]));
+await expectErr('tester cannot clear own badge', () => as(A, `update public.profiles set badge=null where id=$1`, [A]));
+await expectErr('owner cannot grant tester to others', () => as(D, `update public.profiles set badge='tester' where id=$1`, [C]));
+await expectErr('owner cannot change own badge', () => as(D, `update public.profiles set badge='tester' where id=$1`, [D]));
+await expectErr('client cannot insert profile with badge', () => as(C, `insert into public.profiles (id, username, display_name, badge) values (gen_random_uuid(), 'fake_owner', 'x', 'owner')`));
+await expectErr('client cannot upsert own badge', () => as(C, `insert into public.profiles (id, username, display_name, badge) values ($1, 'x_y_z', 'x', 'tester') on conflict (id) do update set badge='tester'`, [C]));
+await as(A, `delete from public.profiles where id=$1`, [C]).catch(() => undefined);
+eq('client cannot delete profile', (await db.query('select count(*)::int n from public.profiles where id=$1', [C])).rows[0].n, 1);
+await expectErr('anonymous client cannot change badge', () => db.exec(`set role anon; update public.profiles set badge='owner' where id='${C}'`)).finally(() => db.exec('reset role'));
+await db.exec('reset role');
+eq('anonymous update changed nothing', await badgeOf(C), null);
+// второй рубеж: триггер срабатывает, даже если разрешение на колонку выдали по ошибке
+await db.exec('grant update (badge) on public.profiles to authenticated');
+await expectErr('trigger blocks self-grant despite mistaken column grant', () => as(C, `update public.profiles set badge='tester' where id=$1`, [C]));
+await expectErr('trigger blocks self-promotion despite mistaken column grant', () => as(A, `update public.profiles set badge='owner' where id=$1`, [A]));
+await db.exec('revoke update (badge) on public.profiles from authenticated');
+// регистрация и метаданные не дают значка
+const F = '00000000-0000-4000-8000-00000000000f';
+await db.exec(`insert into auth.users values ('${F}','f@x','{"username":"new_user_f","badge":"owner"}')`);
+eq('signup metadata cannot set badge', await badgeOf(F), null);
+await expectOk('regular profile edit still works', () => as(F, `update public.profiles set bio='привет', status='idle' where id=$1`, [F]));
+// значок не даёт прав
+const foreign = (await as(D, `select public.create_server('Чужой сервер') id`)).rows[0].id;
+await expectErr('tester gets no rights on foreign server', () => as(A, `update public.servers set name='x' where id=$1`, [foreign]));
+await expectErr('tester cannot create invite for foreign server', () => as(A, `select public.create_invite($1, 5, 24)`, [foreign]));
+eq('tester does not see foreign server', (await as(A, 'select * from public.servers where id=$1', [foreign])).rows.length, 0);
+// повторный запуск миграции и прежний скрипт владельца значки не меняют
+await db.exec(testerSql);
+await db.exec(badgeSql);
+eq('re-run keeps owner', await badgeOf(D), 'owner');
+eq('re-run keeps tester', await badgeOf(A), 'tester');
+eq('admin revoke removes tester', (await db.query(fill(adminRevoke, A))).rows[0].badge, null);
+eq('tester revoked', await badgeOf(A), null);
+eq('second revoke does nothing', (await db.query(fill(adminRevoke, A))).rows.length, 0);
+
 console.log(failures ? `\n${failures} FAILURES` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);
