@@ -37,7 +37,7 @@ export const supabase = createClient(url || 'https://invalid.supabase.co', key |
   },
 });
 
-export function publicUrl(bucket: 'avatars' | 'server-icons', path: string | null | undefined): string | null {
+export function publicUrl(bucket: 'avatars' | 'server-icons' | 'profile-banners', path: string | null | undefined): string | null {
   if (!path) return null;
   return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
 }

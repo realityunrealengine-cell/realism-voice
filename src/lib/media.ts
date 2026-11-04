@@ -68,7 +68,7 @@ export async function removeAttachments(paths: string[]): Promise<void> {
   await supabase.storage.from('attachments').remove(paths);
 }
 
-export async function uploadPublicImage(bucket: 'avatars' | 'server-icons', folder: string, file: File): Promise<string> {
+export async function uploadPublicImage(bucket: 'avatars' | 'server-icons' | 'profile-banners', folder: string, file: File): Promise<string> {
   if (!IMAGE_MIME.includes(file.type)) throw new Error('Поддерживаются PNG, JPEG, GIF и WebP');
   if (file.size > MAX_IMAGE) throw new Error('Изображение должно быть не больше 5 МБ');
   const ext = file.type.split('/')[1].replace('jpeg', 'jpg');

@@ -50,7 +50,10 @@ npx supabase db push
 (`link` спросит пароль базы данных — вводите его сами в терминале.)
 
 Миграции создают: таблицы, индексы, ограничения, триггеры, RPC-функции, RLS-политики,
-Storage-бакеты `avatars`, `server-icons`, `attachments` с политиками, публикацию Realtime и политики Realtime Authorization.
+Storage-бакеты `avatars`, `server-icons`, `profile-banners`, `attachments` с политиками, публикацию Realtime и политики Realtime Authorization.
+
+**Обновление существующей базы:** новую функцию можно применить отдельным файлом, не запуская всё заново. Для баннеров профилей
+вставьте в SQL Editor содержимое `supabase/migrations/20261104000002_profile_banners.sql` и нажмите **Run**. Скрипт ничего не удаляет.
 
 ### 2.2. Аутентификация — ссылки из писем
 

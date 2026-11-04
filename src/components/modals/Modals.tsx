@@ -17,6 +17,8 @@ import { UserBadge } from '@/components/ui/UserBadge';
 import { Field, ModalShell, Select, Spinner, Switch } from '@/components/ui/primitives';
 import { useInvitePreview } from '@/components/chat/InviteEmbed';
 import { ScreenPicker } from '@/components/voice/ScreenPicker';
+import { BannerEditor } from '@/components/settings/BannerEditor';
+import { ProfileBanner } from '@/components/ui/ProfileBanner';
 import { ServerSettingsModal } from './ServerSettingsModal';
 import { ChannelSettingsModal } from './ChannelSettingsModal';
 import { openDmWith, memberMenu } from './memberMenu';
@@ -435,12 +437,11 @@ function ProfileModal({ userId, serverId, onClose }: { userId: string; serverId?
   const allMembers = useServers((s) => s.members);
   const mutual = useMemo(() => servers.filter((sv) => allMembers[sv.id]?.some((m) => m.user_id === userId)), [servers, allMembers, userId]);
   if (!p) return null;
-  const banner = p.accent_color ?? undefined;
   return (
     <ModalShell open onClose={onClose} width="max-w-sm">
-      <div className="h-24 accent-bg" style={banner ? { background: banner } : undefined} />
+      <ProfileBanner path={p.banner_path} accent={p.accent_color} />
       <div className="px-5 pb-5">
-        <div className="-mt-12 mb-3 flex items-end justify-between">
+        <div className="relative -mt-12 mb-3 flex items-end justify-between">
           <div className="rounded-full ring-[6px] ring-base-900">
             <Avatar userId={userId} size={84} showStatus />
           </div>
@@ -562,6 +563,8 @@ export function Modals() {
       return <ChannelSettingsModal channelId={modal.channelId} onClose={close} />;
     case 'screenPicker':
       return <ScreenPicker onClose={close} />;
+    case 'profileBanner':
+      return <BannerEditor onClose={close} />;
     case 'confirm':
       return <ConfirmModal m={modal} onClose={close} />;
   }

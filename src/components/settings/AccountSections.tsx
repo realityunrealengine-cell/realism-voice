@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Camera } from 'lucide-react';
+import { Camera, Image as ImageIcon } from 'lucide-react';
 import { useAuth } from '@/stores/auth';
 import { useSocial } from '@/stores/social';
 import { toast, useUi } from '@/stores/ui';
@@ -8,6 +8,7 @@ import { errorMessage } from '@/lib/errors';
 import { IMAGE_MIME, uploadPublicImage } from '@/lib/media';
 import { Avatar } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
+import { ProfileBanner } from '@/components/ui/ProfileBanner';
 import { Field, Select, Spinner, Switch } from '@/components/ui/primitives';
 import { Card, Row } from './parts';
 
@@ -184,8 +185,8 @@ export function ProfileSection() {
       <div>
         <span className="label">Предпросмотр</span>
         <div className="overflow-hidden rounded-2xl bg-black/30">
-          <div className="h-16 accent-bg" style={useAccent ? { background: accent } : undefined} />
-          <div className="px-4 pb-4">
+          <ProfileBanner path={profile.banner_path} accent={useAccent ? accent : null} />
+          <div className="relative px-4 pb-4">
             <button className="group relative -mt-8 rounded-full ring-4 ring-base-900" onClick={() => fileRef.current?.click()} disabled={uploading}>
               <Avatar userId={profile.id} size={72} />
               <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/50 opacity-0 transition group-hover:opacity-100">
@@ -212,6 +213,9 @@ export function ProfileSection() {
             {bio && <div className="mt-2 whitespace-pre-wrap text-xs text-slate-400">{bio}</div>}
           </div>
         </div>
+        <button className="btn-ghost mt-3 w-full" onClick={() => useUi.getState().openModal({ type: 'profileBanner' })}>
+          <ImageIcon className="h-4 w-4" /> Изменить баннер
+        </button>
         {profile.avatar_path && (
           <button
             className="mt-2 text-xs text-rose-300 hover:underline"

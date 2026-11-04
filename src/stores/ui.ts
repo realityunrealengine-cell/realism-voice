@@ -17,6 +17,7 @@ export type Modal =
   | { type: 'profile'; userId: string; serverId?: string }
   | { type: 'inviteFriend'; userId: string }
   | { type: 'screenPicker' }
+  | { type: 'profileBanner' }
   | { type: 'confirm'; title: string; body: ReactNode; confirmLabel: string; danger?: boolean; onConfirm: () => Promise<void> | void };
 
 export interface ContextMenuItem {
