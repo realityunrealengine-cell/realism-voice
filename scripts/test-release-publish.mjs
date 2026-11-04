@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { publishRelease, RELEASE_FILES } from './publish-release.mjs';
+import { publishRelease, rehearseRelease, RELEASE_FILES } from './publish-release.mjs';
 
 const TAG = 'v1.0.4';
 const REPO = 'owner/repo';
@@ -22,11 +22,10 @@ function fakeGitHub({ releases = [], onCreate, manifest, failPublish = false } =
   const gh = (args) => {
     state.calls.push(args.join(' '));
     if (args[0] === 'release' && args[1] === 'create') {
-      assert.equal(args[2], TAG);
       assert.ok(args.includes('--draft'), 'черновик обязателен');
       const uploaded = args.slice(3, args.indexOf('--repo')).map((f) => path.basename(f));
       const assets = uploaded.map((name) => ({ id: nextId++, name, size: sizes[name], state: 'uploaded' }));
-      const release = { id: nextId++, tag_name: TAG, draft: true, assets };
+      const release = { id: nextId++, tag_name: args[2], draft: true, assets };
       state.releases.push(release);
       onCreate?.(state, release);
       return '';
@@ -121,6 +120,38 @@ test('изменённый latest.yml останавливает публика�
 test('сбой публикации возвращает ошибку', () => {
   const { gh } = fakeGitHub({ failPublish: true });
   assert.throws(() => run(gh), /недоступен/);
+});
+
+const REHEARSAL_TAG = 'dry-run-42';
+const rehearse = (gh, tag = REHEARSAL_TAG) => rehearseRelease({ gh, tag, repo: REPO, dir, notesFile });
+const published103 = { id: 7, tag_name: 'v1.0.3', draft: false, assets: [{ id: 8, name: 'latest.yml', size: 1, state: 'uploaded' }] };
+
+test('репетиция загружает файлы, удаляет черновик и ничего не публикует', () => {
+  const { state, gh } = fakeGitHub({ releases: [published103] });
+  rehearse(gh);
+  assert.ok(state.calls.some((c) => c.startsWith('release create dry-run-42')), 'файлы загружались');
+  assert.equal(state.published, false);
+  assert.ok(!state.calls.some((c) => c.includes('PATCH')), 'нет команды публикации');
+  assert.deepEqual(state.releases, [published103], 'релиз 1.0.3 не затронут, черновика нет');
+});
+
+test('сбой репетиции возвращает ошибку и всё равно удаляет черновик', () => {
+  const { state, gh } = fakeGitHub({ onCreate: (_s, r) => { r.assets = r.assets.filter((a) => a.name !== 'RealismVoice-Setup.exe'); } });
+  assert.throws(() => rehearse(gh), /файл/);
+  assert.equal(state.releases.length, 0);
+  assert.equal(state.published, false);
+});
+
+test('репетиция отказывается работать с тегом версии', () => {
+  const { state, gh } = fakeGitHub({ releases: [published103] });
+  assert.throws(() => rehearse(gh, 'v1.0.3'), /dry-run/);
+  assert.equal(state.calls.length, 0);
+});
+
+test('публикация не трогает другие релизы', () => {
+  const { state, gh } = fakeGitHub({ releases: [published103] });
+  run(gh);
+  assert.deepEqual(state.releases.find((r) => r.id === 7), published103);
 });
 
 fs.rmSync(dir, { recursive: true, force: true });

@@ -1,6 +1,8 @@
 name: Dry run (build without release)
 
-# Пробная сборка вручную: проверяет секреты, сборку и подпись манифеста. Релиз не создаётся, в репозиторий обновлений ничего не пишется.
+# Пробная сборка вручную: проверяет секреты, сборку, подпись манифеста и настоящую загрузку файлов.
+# Файлы попадают во временный черновик dry-run-… репозитория обновлений, который удаляется в том же шаге.
+# Пользователи его не видят, релиз и тег не создаются.
 on:
   workflow_dispatch:
 
@@ -28,17 +30,11 @@ jobs:
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
 
-      # Только чтение: токен должен иметь право записи в репозиторий обновлений
-      - name: Check release token access
-        run: |
-          $repo = node scripts/check-release.mjs repo
-          $push = gh api "repos/$repo" --jq .permissions.push
-          if ($push -ne 'true') { Write-Output "::error::RELEASES_GH_TOKEN не имеет права записи в $repo"; exit 1 }
-        env:
-          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
-
       - name: Install dependencies
         run: npm ci
+
+      - name: Test release publishing script
+        run: npm run test:release
 
       - name: Test database migrations and RLS policies
         run: npm run test:sql
@@ -60,6 +56,11 @@ jobs:
 
       - name: Verify update metadata
         run: node scripts/check-release.mjs post
+
+      - name: Rehearse upload (temporary draft, deleted right away)
+        run: node scripts/publish-release.mjs --rehearse
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
