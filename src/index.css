@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --a1: #5b7cfa;
+  --a2: #a855f7;
+  --font-scale: 1;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  font-size: calc(15px * var(--font-scale));
+}
+
+body {
+  @apply bg-base-950 font-sans text-slate-200 antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--a2) 45%, transparent);
+}
+
+input,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
+}
+
+.reduce-motion *,
+.reduce-motion *::before,
+.reduce-motion *::after {
+  transition-duration: 0ms !important;
+  animation-duration: 0ms !important;
+}
+
+@layer components {
+  .glass {
+    background: rgba(18, 22, 41, 0.55);
+    backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .no-glass .glass {
+    background: rgb(15, 18, 33);
+    backdrop-filter: none;
+  }
+  .glass-strong {
+    background: rgba(13, 16, 32, 0.82);
+    backdrop-filter: blur(24px) saturate(150%);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .accent-bg {
+    background-image: linear-gradient(135deg, var(--a1) 0%, var(--a2) 100%);
+  }
+  .accent-text {
+    background-image: linear-gradient(135deg, var(--a1) 0%, var(--a2) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .accent-ring {
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--a2) 55%, transparent),
+      0 8px 28px -8px color-mix(in srgb, var(--a1) 70%, transparent);
+  }
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn text-white shadow-lg hover:brightness-110 active:scale-[0.98];
+    background-image: linear-gradient(135deg, var(--a1) 0%, var(--a2) 100%);
+    box-shadow: 0 6px 20px -8px color-mix(in srgb, var(--a1) 80%, transparent);
+  }
+  .btn-ghost {
+    @apply btn bg-white/5 text-slate-200 hover:bg-white/10 active:scale-[0.98];
+  }
+  .btn-danger {
+    @apply btn bg-rose-500/90 text-white hover:bg-rose-500 active:scale-[0.98];
+  }
+  .input {
+    @apply w-full rounded-xl border border-white/10 bg-black/30 px-3.5 py-2.5 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-[color:var(--a2)] focus:bg-black/40;
+  }
+  .label {
+    @apply mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-slate-400;
+  }
+  .icon-btn {
+    @apply inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-white/10 hover:text-slate-100;
+  }
+  .drag-region {
+    -webkit-app-region: drag;
+  }
+  .no-drag {
+    -webkit-app-region: no-drag;
+  }
+}
+
+.mention-chip {
+  @apply rounded px-1 font-medium;
+  background: color-mix(in srgb, var(--a1) 25%, transparent);
+  color: #c7d2fe;
+}
+
+.msg-mentioned {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--a2) 14%, transparent), transparent 70%);
+  box-shadow: inset 2px 0 0 0 var(--a2);
+}
+
+.speaking-ring {
+  box-shadow: 0 0 0 2px #34d399, 0 0 16px 2px rgba(52, 211, 153, 0.45);
+}
+
+video.mirror {
+  transform: scaleX(-1);
+}

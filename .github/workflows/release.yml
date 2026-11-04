@@ -1,0 +1,74 @@
+name: Release
+
+# Запускается тегом вида v1.0.3. Обновление становится видно пользователям только на последнем шаге:
+# до этого файлы лежат в черновике релиза, который electron-updater не видит.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+# Исходники только читаются. В публичный репозиторий релизов пишет отдельный токен RELEASES_GH_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check release settings
+        run: node scripts/check-release.mjs pre "$env:GITHUB_REF_NAME"
+        env:
+          HAS_SIGNING_CERT: ${{ secrets.CSC_LINK != '' }}
+          HAS_RELEASES_TOKEN: ${{ secrets.RELEASES_GH_TOKEN != '' }}
+          ALLOW_UNSIGNED_UPDATES: ${{ vars.ALLOW_UNSIGNED_UPDATES }}
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check TypeScript
+        run: npm run typecheck
+
+      - name: Test database migrations and RLS policies
+        run: npm run test:sql
+
+      # Публичные параметры клиента задаются в Settings → Secrets and variables → Actions → Variables.
+      # Секреты LiveKit и Supabase сюда НЕ передаются.
+      - name: Build application
+        run: |
+          npm run build:electron
+          npm run build:renderer
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ vars.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          VITE_ENABLE_GOOGLE_AUTH: ${{ vars.VITE_ENABLE_GOOGLE_AUTH }}
+
+      # Создаёт установщик, latest.yml и .blockmap и загружает их в черновик релиза.
+      - name: Build installer and upload to draft release
+        run: npx electron-builder --win nsis --x64 --publish always
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK != '' && 'true' || 'false' }}
+
+      - name: Verify update metadata
+        run: node scripts/check-release.mjs post
+
+      - name: Publish release
+        run: |
+          $repo = node scripts/check-release.mjs repo
+          gh release edit "$env:GITHUB_REF_NAME" --repo $repo --draft=false --latest --title "Realism Voice $env:GITHUB_REF_NAME" --notes-file build/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GH_TOKEN }}

@@ -1,0 +1,8 @@
+# Минимальная конфигурация Supabase CLI для проекта Realism Voice.
+# Связывание с облаком: supabase link --project-ref yqoxdrkxgnputpqsclzx
+project_id = "realism-voice"
+
+[functions.livekit-token]
+# JWT проверяется внутри функции через auth.getUser() — это работает и с новыми
+# асимметричными ключами подписи JWT Supabase.
+verify_jwt = false

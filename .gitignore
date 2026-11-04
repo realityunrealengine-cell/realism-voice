@@ -1,0 +1,50 @@
+# Зависимости и сборка
+node_modules/
+dist/
+dist-electron/
+release/
+release-test/
+*.tsbuildinfo
+builder-debug.yml
+builder-effective-config.yaml
+
+# Резервные копии и установщики
+backups/
+*.exe
+*.msi
+*.blockmap
+*.asar
+*.7z
+*.zip
+
+# Журналы и служебные файлы системы
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Локальные настройки редакторов и инструментов
+.vscode/
+.idea/
+.claude/
+
+# Секреты и локальная конфигурация — никогда не коммитить
+.env
+.env.*
+!.env.example
+.npmrc
+supabase/.env
+supabase/functions/.env
+supabase/.temp/
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.spc
+*.snk
+*.token
+credentials*.json
+service-account*.json
