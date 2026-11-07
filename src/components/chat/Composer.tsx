@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { FileText, Paperclip, Send, Smile, X } from 'lucide-react';
-import type { Profile, Scope } from '@/lib/types';
+import { AnimatePresence, motion } from 'framer-motion';
+import { FileText, Folder, FolderUp, FileUp, Plus, Send, ShieldAlert, Smile, X } from 'lucide-react';
+import type { OutgoingItem, Profile, Scope } from '@/lib/types';
+import type { PickedItem } from '../../../electron/shared';
+import { isDangerousFile } from '../../../electron/fileRisk';
 import { useMessages, findMessage } from '@/stores/messages';
 import { useProfile, useProfiles } from '@/stores/profiles';
 import { useServers } from '@/stores/servers';
 import { useAuth } from '@/stores/auth';
 import { toast, useUi } from '@/stores/ui';
-import { MAX_ATTACHMENT } from '@/lib/media';
-import { formatSize } from '@/lib/format';
+import { FREE_MAX_ATTACHMENT, MAX_ATTACHMENTS_PER_MESSAGE, maxAttachmentBytes } from '@/lib/media';
+import { formatSize, plural } from '@/lib/format';
 import { Avatar } from '@/components/ui/Avatar';
 import { EmojiPicker } from './EmojiPicker';
 import { lastOwnEditable } from './MessageItem';
+
+/** Исходный объём папки до сжатия (ограничение main-процесса) */
+const MAX_FOLDER_SOURCE = 1024 * 1024 * 1024;
+
+function tooBigText(name: string, size: number, max: number): string {
+  return `«${name}» — ${formatSize(size)}. Бесплатное хранилище Realism Voice принимает файлы до ${formatSize(max)}. Для больших файлов отправьте ссылку на облачный диск.`;
+}
 
 interface Props {
   scope: Scope;
@@ -24,22 +34,79 @@ interface Props {
 
 const drafts = new Map<string, string>();
 
-function FilePreview({ file, onRemove }: { file: File; onRemove: () => void }) {
-  const url = useMemo(() => (file.type.startsWith('image/') ? URL.createObjectURL(file) : null), [file]);
+function FilePreview({ item, onRemove }: { item: OutgoingItem; onRemove: () => void }) {
+  const src = item.previewFile ?? item.blob;
+  const url = useMemo(() => (src && src.type.startsWith('image/') ? URL.createObjectURL(src) : null), [src]);
   useEffect(() => () => {
     if (url) URL.revokeObjectURL(url);
   }, [url]);
+  const dangerous = item.kind === 'file' && isDangerousFile(item.name);
   return (
-    <div className="relative w-36 shrink-0 rounded-xl border border-white/10 bg-black/30 p-2">
+    <motion.div
+      layout
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.9 }}
+      className="relative w-36 shrink-0 rounded-xl border border-white/10 bg-black/30 p-2"
+    >
       <button onClick={onRemove} className="absolute -right-2 -top-2 rounded-full bg-rose-500 p-0.5 text-white shadow" title="Убрать">
         <X className="h-3.5 w-3.5" />
       </button>
       <div className="flex h-20 items-center justify-center overflow-hidden rounded-lg bg-black/30">
-        {url ? <img src={url} alt="" className="h-full w-full object-cover" /> : <FileText className="h-8 w-8 text-indigo-300" />}
+        {url ? (
+          <img src={url} alt="" className="h-full w-full object-cover" />
+        ) : item.kind === 'folder' ? (
+          <Folder className="h-8 w-8 text-amber-300" />
+        ) : dangerous ? (
+          <ShieldAlert className="h-8 w-8 text-rose-300" />
+        ) : (
+          <FileText className="h-8 w-8 text-indigo-300" />
+        )}
       </div>
-      <div className="mt-1 truncate text-xs text-slate-300">{file.name}</div>
-      <div className="text-[10px] text-slate-500">{formatSize(file.size)}</div>
-    </div>
+      <div className="mt-1 truncate text-xs text-slate-300" title={item.name}>
+        {item.name}
+      </div>
+      <div className="truncate text-[10px] text-slate-500">
+        {item.kind === 'folder'
+          ? `${item.files ?? 0} ${plural(item.files ?? 0, 'файл', 'файла', 'файлов')} · ${formatSize(item.size)} → ZIP`
+          : formatSize(item.size)}
+      </div>
+    </motion.div>
+  );
+}
+
+function AttachMenu({ onFile, onFolder, onClose, maxFile }: { onFile: () => void; onFolder: () => void; onClose: () => void; maxFile: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const down = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && onClose();
+    const key = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    setTimeout(() => window.addEventListener('mousedown', down), 0);
+    window.addEventListener('keydown', key);
+    return () => {
+      window.removeEventListener('mousedown', down);
+      window.removeEventListener('keydown', key);
+    };
+  }, [onClose]);
+  const item = 'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm text-slate-200 hover:bg-white/10 [&>svg]:h-4 [&>svg]:w-4';
+  return (
+    <motion.div
+      ref={ref}
+      initial={{ opacity: 0, y: 6, scale: 0.98 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: 6, scale: 0.98 }}
+      transition={{ duration: 0.12 }}
+      className="glass-strong absolute bottom-12 left-0 z-30 w-60 rounded-xl p-1.5 shadow-glass"
+    >
+      <button className={item} onClick={onFile}>
+        <FileUp /> Отправить файл
+      </button>
+      <button className={item} onClick={onFolder}>
+        <FolderUp /> Отправить папку
+      </button>
+      <div className="mt-1 border-t border-white/5 px-2.5 pb-1 pt-2 text-[11px] leading-snug text-slate-500">
+        До {formatSize(maxFile)} на файл · папка сжимается в ZIP · до {MAX_ATTACHMENTS_PER_MESSAGE} вложений
+      </div>
+    </motion.div>
   );
 }
 
@@ -62,7 +129,9 @@ function ReplyBar({ scope }: { scope: Scope }) {
 
 export function Composer({ scope, serverId, placeholder, disabled, onTyping, onStopTyping, mentionCandidates }: Props) {
   const [text, setText] = useState(() => drafts.get(scope.id) ?? '');
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<OutgoingItem[]>([]);
+  const [menu, setMenu] = useState(false);
+  const [maxFile, setMaxFile] = useState(FREE_MAX_ATTACHMENT);
   const [emoji, setEmoji] = useState(false);
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
   const [mentionIdx, setMentionIdx] = useState(0);
@@ -98,11 +167,97 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
       .slice(0, 8);
   }, [mention, members, profiles, serverId, mentionCandidates]);
 
-  const addFiles = (list: FileList | File[]) => {
+  useEffect(() => {
+    void maxAttachmentBytes().then(setMaxFile);
+  }, [scope.id]);
+
+  /** Проверка до загрузки: размер, пустые файлы, число вложений */
+  const accept = (incoming: OutgoingItem[]) => {
+    const ok: OutgoingItem[] = [];
+    const rejected: string[] = [];
+    for (const it of incoming) {
+      if (it.kind === 'file' && it.size > maxFile) {
+        toast.error('Файл слишком большой', tooBigText(it.name, it.size, maxFile));
+        if (it.token) rejected.push(it.token);
+        continue;
+      }
+      if (it.kind === 'folder' && it.size > MAX_FOLDER_SOURCE) {
+        toast.error('Папка слишком большая', `«${it.name}» — ${formatSize(it.size)} до сжатия. Можно отправить папку, которая после сжатия в ZIP уложится в ${formatSize(maxFile)}.`);
+        if (it.token) rejected.push(it.token);
+        continue;
+      }
+      ok.push(it);
+    }
+    setFiles((prev) => {
+      const next = [...prev, ...ok];
+      if (next.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        toast.info('Слишком много вложений', `В одном сообщении — до ${MAX_ATTACHMENTS_PER_MESSAGE}. Остальные отправьте следующим сообщением.`);
+        for (const extra of next.slice(MAX_ATTACHMENTS_PER_MESSAGE)) if (extra.token) rejected.push(extra.token);
+      }
+      return next.slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+    });
+    if (rejected.length) void window.rv?.files.release(rejected);
+  };
+
+  const fromPicked = (list: PickedItem[], previews: File[] = []) => {
+    const out: OutgoingItem[] = [];
+    for (const p of list) {
+      if (p.error) {
+        toast.error(p.kind === 'folder' ? 'Папку нельзя отправить' : 'Файл нельзя отправить', `«${p.name}»: ${p.error}`);
+        void window.rv?.files.release([p.token]);
+        continue;
+      }
+      out.push({
+        key: p.token,
+        token: p.token,
+        name: p.name,
+        size: p.size,
+        kind: p.kind,
+        files: p.files,
+        dirs: p.dirs,
+        previewFile: previews.find((f) => f.name === p.name && f.size === p.size),
+      });
+    }
+    accept(out);
+  };
+
+  const fromBlobs = (list: File[]) =>
+    accept(list.map((f) => ({ key: crypto.randomUUID(), name: f.name || `image-${Date.now()}.png`, size: f.size, kind: 'file' as const, blob: f, mime: f.type })));
+
+  /** Файлы и папки из перетаскивания или вставки: с диска — через main-процесс, иначе как данные */
+  const addDropped = async (list: FileList | File[]) => {
     const arr = [...list];
-    const big = arr.find((f) => f.size > MAX_ATTACHMENT);
-    if (big) toast.error('Файл слишком большой', `«${big.name}» больше 25 МБ`);
-    setFiles((prev) => [...prev, ...arr.filter((f) => f.size <= MAX_ATTACHMENT)].slice(0, 10));
+    if (!arr.length) return;
+    if (!window.rv?.files) {
+      fromBlobs(arr);
+      return;
+    }
+    const picked = await window.rv.files.registerDropped(arr);
+    fromPicked(picked, arr);
+    const registeredNames = new Set(picked.map((p) => p.name));
+    // Данные без файла на диске (например, скриншот из буфера обмена)
+    const blobs = arr.filter((f) => !registeredNames.has(f.name) && f.size > 0 && f.type);
+    if (blobs.length) fromBlobs(blobs);
+  };
+
+  const pickFiles = async () => {
+    setMenu(false);
+    const picked = await window.rv?.files.pickFiles();
+    if (picked?.length) fromPicked(picked);
+  };
+
+  const pickFolder = async () => {
+    setMenu(false);
+    const picked = await window.rv?.files.pickFolder();
+    if (picked) fromPicked([picked]);
+  };
+
+  const removeItem = (key: string) => {
+    setFiles((prev) => {
+      const it = prev.find((x) => x.key === key);
+      if (it?.token) void window.rv?.files.release([it.token]);
+      return prev.filter((x) => x.key !== key);
+    });
   };
 
   const send = async () => {
@@ -115,11 +270,8 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
     drafts.delete(scope.id);
     useUi.getState().setReplyTo(scope.id, null);
     onStopTyping();
-    try {
-      await useMessages.getState().send(scope, content, toSend, replyTo);
-    } catch (e) {
-      toast.error('Сообщение не отправлено', (e as Error).message);
-    }
+    // Ошибки показывает хранилище сообщений (с кнопкой «Повторить» у сообщения)
+    await useMessages.getState().send(scope, content, toSend, replyTo).catch(() => undefined);
   };
 
   const insertMention = (p: Profile) => {
@@ -204,12 +356,13 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
       onDrop={(e) => {
         e.preventDefault();
         setDragOver(false);
-        if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+        if (e.dataTransfer.files.length) void addDropped(e.dataTransfer.files);
       }}
     >
       {dragOver && (
-        <div className="pointer-events-none absolute inset-x-4 bottom-5 top-0 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[color:var(--a2)] bg-black/60 text-sm text-white">
-          Отпустите, чтобы прикрепить файлы
+        <div className="pointer-events-none absolute inset-x-4 bottom-5 top-0 z-20 flex flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed border-[color:var(--a2)] bg-black/60 text-sm text-white">
+          Отпустите, чтобы прикрепить файлы или папки
+          <span className="text-xs text-slate-400">до {formatSize(maxFile)} на файл · папки сжимаются в ZIP</span>
         </div>
       )}
       {mention && suggestions.length > 0 && (
@@ -234,22 +387,33 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
       <ReplyBar scope={scope} />
       {files.length > 0 && (
         <div className="flex gap-3 overflow-x-auto bg-black/30 px-4 pb-2 pt-4">
-          {files.map((f, i) => (
-            <FilePreview key={`${f.name}-${i}`} file={f} onRemove={() => setFiles(files.filter((_, j) => j !== i))} />
-          ))}
+          <AnimatePresence initial={false}>
+            {files.map((f) => (
+              <FilePreview key={f.key} item={f} onRemove={() => removeItem(f.key)} />
+            ))}
+          </AnimatePresence>
         </div>
       )}
       <div className="flex items-end gap-2 rounded-xl border border-white/5 bg-black/35 px-3 py-2 focus-within:border-white/15">
-        <button className="icon-btn mb-0.5" title="Прикрепить файл" onClick={() => fileRef.current?.click()}>
-          <Paperclip className="h-5 w-5" />
-        </button>
+        <div className="relative">
+          <button
+            className={`icon-btn mb-0.5 transition ${menu ? 'rotate-45 bg-white/10 text-white' : ''}`}
+            title="Прикрепить файл или папку"
+            onClick={() => (window.rv?.files ? setMenu(!menu) : fileRef.current?.click())}
+          >
+            <Plus className="h-5 w-5" />
+          </button>
+          <AnimatePresence>
+            {menu && <AttachMenu maxFile={maxFile} onFile={() => void pickFiles()} onFolder={() => void pickFolder()} onClose={() => setMenu(false)} />}
+          </AnimatePresence>
+        </div>
         <input
           ref={fileRef}
           type="file"
           multiple
           hidden
           onChange={(e) => {
-            if (e.target.files) addFiles(e.target.files);
+            if (e.target.files) void addDropped(e.target.files);
             e.target.value = '';
           }}
         />
@@ -265,7 +429,7 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
           onPaste={(e) => {
             if (e.clipboardData.files.length) {
               e.preventDefault();
-              addFiles(e.clipboardData.files);
+              void addDropped(e.clipboardData.files);
             }
           }}
           className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[0.95rem] text-slate-100 outline-none placeholder:text-slate-500"

@@ -55,6 +55,98 @@ export interface UpdateState {
   signatureRequired: boolean;
 }
 
+export type PowerEvent = 'suspend' | 'resume' | 'lock-screen' | 'unlock-screen';
+
+// ---------- Передача файлов ----------
+
+/** Файл или папка, выбранные пользователем; путь на диске остаётся в main-процессе */
+export interface PickedItem {
+  token: string;
+  kind: 'file' | 'folder';
+  name: string;
+  /** Размер файла; для папки — суммарный размер файлов до сжатия */
+  size: number;
+  /** Для папки: число файлов и пустых папок */
+  files?: number;
+  dirs?: number;
+  /** Причина, по которой элемент нельзя отправить (слишком большой и т.п.) */
+  error?: string | null;
+}
+
+export interface UploadRequest {
+  /** Идентификатор задачи, выбирает renderer */
+  id: string;
+  token: string;
+  /** Конечная точка TUS Supabase Storage и путь объекта, выданный сервером (reserve_attachment) */
+  endpoint: string;
+  bucket: string;
+  objectPath: string;
+  contentType: string;
+  accessToken: string;
+  apiKey: string;
+  /** Максимальный размер отправляемого файла (после сжатия папки) */
+  maxBytes: number;
+}
+
+export type TransferPhase = 'preparing' | 'uploading' | 'paused' | 'waiting-network' | 'done' | 'error' | 'cancelled';
+
+export interface TransferProgress {
+  id: string;
+  phase: TransferPhase;
+  /** Подготовка папки: сколько файлов уже упаковано */
+  packedFiles?: number;
+  totalFiles?: number;
+  transferred: number;
+  total: number;
+  bytesPerSecond: number;
+  error?: string | null;
+  /** Итог: размер отправленного объекта и тип */
+  result?: { size: number; contentType: string; sha256?: string } | null;
+}
+
+export interface DownloadRequest {
+  id: string;
+  url: string;
+  name: string;
+  /** zip-архив папки: распаковать в выбранную папку с сохранением структуры */
+  extractFolder: boolean;
+  size: number;
+}
+
+export interface DownloadProgress {
+  id: string;
+  phase: 'choosing' | 'downloading' | 'extracting' | 'done' | 'error' | 'cancelled';
+  transferred: number;
+  total: number;
+  bytesPerSecond: number;
+  savedPath?: string | null;
+  error?: string | null;
+}
+
+export interface FilesBridge {
+  /** Окно выбора файлов (несколько) */
+  pickFiles(): Promise<PickedItem[]>;
+  /** Окно выбора папки */
+  pickFolder(): Promise<PickedItem | null>;
+  /** Перетащенные в окно файлы и папки (объекты File из события drop) */
+  registerDropped(files: File[]): Promise<PickedItem[]>;
+  release(tokens: string[]): Promise<void>;
+  /** Проверить файл или упаковать папку в ZIP; возвращает размер того, что будет отправлено */
+  prepare(id: string, token: string, maxBytes: number): Promise<{ size: number; contentType: string }>;
+  /** Начать или продолжить (после паузы/обрыва) загрузку; завершается, когда файл принят сервером */
+  upload(req: UploadRequest): Promise<void>;
+  /** Приостановить (отменить с сохранением прогресса) / отменить загрузку */
+  pause(id: string): Promise<void>;
+  cancel(id: string): Promise<void>;
+  onUploadProgress(cb: (p: TransferProgress) => void): () => void;
+  download(req: DownloadRequest): Promise<void>;
+  cancelDownload(id: string): Promise<void>;
+  onDownloadProgress(cb: (p: DownloadProgress) => void): () => void;
+  showInFolder(path: string): Promise<void>;
+  /** Открыть скачанный файл; для потенциально опасных типов возвращает false без открытия, если нет подтверждения */
+  openDownloaded(path: string, confirmedDangerous: boolean): Promise<'opened' | 'needs-confirmation' | 'missing'>;
+}
+
 export interface RvBridge {
   platform: string;
   storage: {
@@ -74,8 +166,11 @@ export interface RvBridge {
     consumeDeepLink(): Promise<DeepLink | null>;
     onDeepLink(cb: (link: DeepLink) => void): () => void;
     onHotkey(cb: (action: 'toggleMute' | 'toggleDeafen') => void): () => void;
+    /** Сон/пробуждение Windows и блокировка экрана */
+    onPower(cb: (event: PowerEvent) => void): () => void;
     quit(): void;
   };
+  files: FilesBridge;
   screen: {
     getSources(): Promise<ScreenSource[]>;
     select(id: string | null, withAudio: boolean): Promise<void>;

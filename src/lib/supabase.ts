@@ -4,6 +4,8 @@ const url = import.meta.env.VITE_SUPABASE_URL?.trim();
 const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim();
 
 export const SUPABASE_URL = url ?? '';
+/** Публичный (publishable) ключ — он и так встроен в приложение; секретные ключи здесь не используются */
+export const SUPABASE_PUBLISHABLE_KEY = key ?? '';
 export const configError =
   !url || !key
     ? 'Не заданы VITE_SUPABASE_URL и VITE_SUPABASE_PUBLISHABLE_KEY. Создайте файл .env.local по образцу .env.example и пересоберите приложение.'
@@ -34,6 +36,8 @@ export const supabase = createClient(url || 'https://invalid.supabase.co', key |
   },
   realtime: {
     params: { eventsPerSecond: 20 },
+    // Быстрее замечаем потерю соединения: сервер считает клиента отключённым, если нет heartbeat
+    heartbeatIntervalMs: 15_000,
   },
 });
 

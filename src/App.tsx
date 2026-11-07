@@ -6,6 +6,8 @@ import { bootstrap, teardown } from '@/lib/realtime';
 import { useAuth } from '@/stores/auth';
 import { ACCENTS, useSettings } from '@/stores/settings';
 import { useUi } from '@/stores/ui';
+import { useConnectivity } from '@/stores/connectivity';
+import { subscribeTransferEvents } from '@/stores/transfers';
 import type { DeepLink } from '../electron/shared';
 import { AuthScreen } from '@/components/auth/AuthScreen';
 import { AppShell } from '@/components/layout/AppShell';
@@ -90,7 +92,12 @@ export default function App() {
     void useSettings.getState().loadApp();
     const off = window.rv?.app.onDeepLink(handleDeepLink);
     void window.rv?.app.consumeDeepLink().then((l) => l && handleDeepLink(l));
-    return () => off?.();
+    const offNet = useConnectivity.getState().init();
+    subscribeTransferEvents();
+    return () => {
+      off?.();
+      offNet();
+    };
   }, []);
 
   useEffect(() => {

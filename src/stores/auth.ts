@@ -31,6 +31,12 @@ interface AuthState {
 
 let initialized = false;
 
+/** Действия перед выходом из аккаунта (пока токен ещё действителен): уход из голоса, снятие присутствия */
+const beforeSignOut: (() => Promise<void>)[] = [];
+export function onBeforeSignOut(fn: () => Promise<void>) {
+  beforeSignOut.push(fn);
+}
+
 export const useAuth = create<AuthState>((set, get) => ({
   status: 'loading',
   session: null,
@@ -155,6 +161,7 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 
   signOut: async () => {
+    await Promise.allSettled(beforeSignOut.map((fn) => fn()));
     await supabase.auth.signOut();
     set({ session: null, userId: null, profile: null, status: 'signedOut' });
   },

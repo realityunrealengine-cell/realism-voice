@@ -15,8 +15,16 @@ import { useSettings } from '@/stores/settings';
 import { useVoice } from '@/stores/voice';
 import { useCalls } from '@/stores/calls';
 import { sounds } from './sounds';
+import { cleanupStaleUploads } from './media';
+import { onBeforeSignOut } from '@/stores/auth';
 
 let channel: RealtimeChannel | null = null;
+
+// Перед выходом из аккаунта: уйти из голоса и снять присутствие, пока токен ещё действителен
+onBeforeSignOut(async () => {
+  await useVoice.getState().leave();
+  await usePresence.getState().stop();
+});
 
 type Ev = 'INSERT' | 'UPDATE' | 'DELETE';
 
@@ -102,6 +110,7 @@ function handleMessageInsert(msg: Message) {
 export function startRealtime() {
   if (channel) return;
   const me = useAuth.getState().userId;
+  const gen = ++channelGen;
   channel = supabase
     .channel('db-changes')
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (p) =>
@@ -142,17 +151,47 @@ export function startRealtime() {
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'profiles' }, (p) => {
       const prof = p.new as Profile;
       useProfiles.getState().upsert([prof]);
-      if (prof.id === me) useAuth.setState({ profile: prof });
+      if (prof.id === me) {
+        useAuth.setState({ profile: prof });
+        // Статус сменили на другом устройстве (например, «Невидимый») — применяем и здесь,
+        // иначе это устройство продолжило бы показывать пользователя в сети
+        if (prof.status) usePresence.getState().setStatus(prof.status);
+      }
     })
     .subscribe((status) => {
+      if (gen !== channelGen) return;
       // После восстановления соединения догружаем то, что могли пропустить
       if (status === 'SUBSCRIBED') {
+        restartAttempt = 0;
         void useUnread.getState().load();
+        return;
       }
+      // Канал закрыт сервером (истёк токен, сон, обрыв) — realtime-js сам его не вернёт: пересоздаём
+      scheduleRestart();
     });
 }
 
+let channelGen = 0;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let restartAttempt = 0;
+function scheduleRestart() {
+  if (restartTimer) return;
+  const delay = [1000, 2000, 5000, 10000, 30000][Math.min(restartAttempt++, 4)];
+  restartTimer = setTimeout(async () => {
+    restartTimer = null;
+    if (!channel || !useAuth.getState().userId) return;
+    const old = channel;
+    channel = null;
+    channelGen++; // события закрытия старого канала больше не учитываются
+    await supabase.removeChannel(old).catch(() => undefined);
+    startRealtime();
+  }, delay);
+}
+
 export function stopRealtime() {
+  channelGen++;
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = null;
   if (channel) void supabase.removeChannel(channel);
   channel = null;
 }
@@ -167,11 +206,13 @@ export async function bootstrap() {
   // Профили собеседников в ЛС
   const me = auth.userId;
   useProfiles.getState().ensure(useSocial.getState().dms.map((d) => dmPeer(d, me)));
+  // Удаляем собственные брошенные загрузки (отменённые, прерванные) — бережём бесплатную квоту хранилища
+  setTimeout(() => void cleanupStaleUploads(), 15_000);
 }
 
 export function teardown() {
   stopRealtime();
-  usePresence.getState().stop();
+  void usePresence.getState().stop();
   void useVoice.getState().leave();
   useServers.getState().reset();
   useMessages.getState().reset();

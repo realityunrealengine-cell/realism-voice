@@ -15,6 +15,7 @@ import { Slider, Spinner } from '@/components/ui/primitives';
 import { UserBadge } from '@/components/ui/UserBadge';
 import { QUALITY } from '@/components/layout/UserPanel';
 import { CallTimer } from './CallTimer';
+import { TONE_DOT, TONE_PILL, VOICE_STATUS_UI } from './voiceStatusUi';
 
 function TrackVideo({ track, mirror, contain }: { track: Track; mirror?: boolean; contain?: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
@@ -129,6 +130,8 @@ export function VoiceView() {
   const status = useVoice((s) => s.status);
   const target = useVoice((s) => s.target);
   const error = useVoice((s) => s.error);
+  const notice = useVoice((s) => s.notice);
+  const reconnectAttempt = useVoice((s) => s.reconnectAttempt);
   const participants = useVoice((s) => s.participants);
   const muted = useVoice((s) => s.muted);
   const deafened = useVoice((s) => s.deafened);
@@ -143,11 +146,12 @@ export function VoiceView() {
   const v = useVoice.getState();
   const ui = useUi.getState();
 
-  if (!target && status !== 'error') {
+  if (!target && status !== 'error' && status !== 'lost') {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 text-slate-400">
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-slate-400">
         <Radio className="h-10 w-10" />
         Вы не подключены к голосовому каналу
+        {notice && <div className="max-w-md text-sm text-amber-200/80">{notice}</div>}
         <button className="btn-ghost" onClick={() => ui.setVoiceViewOpen(false)}>
           Вернуться к чату
         </button>
@@ -163,7 +167,11 @@ export function VoiceView() {
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/5 px-4">
         <Volume2 className="h-5 w-5 text-emerald-400" />
         <span className="font-semibold text-white">{target?.name ?? 'Голосовая связь'}</span>
-        <span className="text-sm text-slate-500">· {participants.length} в канале</span>
+        {status === 'connected' && <span className="text-sm text-slate-500">· {participants.length} в канале</span>}
+        <span className={`ml-1 flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ${TONE_PILL[VOICE_STATUS_UI[status].tone]}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${TONE_DOT[VOICE_STATUS_UI[status].tone]}`} />
+          {VOICE_STATUS_UI[status].label}
+        </span>
         <CallTimer className="ml-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300" />
         <div className="flex-1" />
         <button className="icon-btn" title="Открыть чат" onClick={() => ui.setVoiceViewOpen(false)}>
@@ -172,16 +180,16 @@ export function VoiceView() {
       </header>
 
       <div className="relative min-h-0 flex-1 overflow-y-auto p-5">
-        {status === 'error' ? (
+        {status === 'error' || status === 'lost' ? (
           <div className="mx-auto mt-16 max-w-lg rounded-2xl border border-rose-500/20 bg-rose-500/10 p-6">
             <div className="mb-2 flex items-center gap-2 font-semibold text-rose-200">
-              <AlertTriangle className="h-5 w-5" /> Голосовая связь не установлена
+              <AlertTriangle className="h-5 w-5" /> {status === 'lost' ? 'Соединение потеряно' : 'Голосовая связь не установлена'}
             </div>
             <p className="text-sm leading-relaxed text-rose-100/80">{error}</p>
             <div className="mt-4 flex gap-2">
               {target && (
-                <button className="btn-primary" onClick={() => void v.join(target)}>
-                  <RefreshCw className="h-4 w-4" /> Повторить
+                <button className="btn-primary" onClick={() => void v.retry()}>
+                  <RefreshCw className="h-4 w-4" /> {status === 'lost' ? 'Переподключиться' : 'Повторить'}
                 </button>
               )}
               <button className="btn-ghost" onClick={() => void v.leave()}>
@@ -221,7 +229,7 @@ export function VoiceView() {
         )}
         {status === 'reconnecting' && (
           <div className="absolute left-1/2 top-4 flex -translate-x-1/2 items-center gap-2 rounded-full bg-amber-500/20 px-4 py-1.5 text-sm text-amber-200">
-            <Spinner /> Переподключение…
+            <Spinner /> Переподключение…{reconnectAttempt > 0 ? ` попытка ${reconnectAttempt}` : ''}
           </div>
         )}
       </div>

@@ -19,5 +19,5 @@
       "@/*": ["src/*"]
     }
   },
-  "include": ["src", "electron/shared.ts"]
+  "include": ["src", "electron/shared.ts", "electron/fileRisk.ts", "electron/zipPaths.ts"]
 }

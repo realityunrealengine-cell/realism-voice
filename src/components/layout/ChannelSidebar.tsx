@@ -8,7 +8,8 @@ import { useServers } from '@/stores/servers';
 import { useUi, toast } from '@/stores/ui';
 import { useUnread } from '@/stores/unread';
 import { usePresence, type VoiceMember } from '@/stores/presence';
-import { useVoice } from '@/stores/voice';
+import { liveParticipants, useVoice } from '@/stores/voice';
+import { channelRoster, serverRoster } from '@/lib/voiceRoster';
 import { useProfile } from '@/stores/profiles';
 import { Avatar } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
@@ -39,8 +40,9 @@ export function ChannelSidebar({ serverId }: { serverId: string }) {
   const channels = useServers((s) => s.channels[serverId]) ?? [];
   const role = useServers((s) => s.myRoles[serverId]);
   const counts = useUnread((s) => s.counts);
-  const voiceMembers = usePresence((s) => s.voice[serverId]) ?? [];
+  const presenceMembers = usePresence((s) => s.voice[serverId]);
   const voiceTarget = useVoice((s) => s.target);
+  const voiceStatus = useVoice((s) => s.status);
   const participants = useVoice((s) => s.participants);
   const lastChannel = useUi((s) => s.lastChannel[serverId]);
   const voiceViewOpen = useUi((s) => s.voiceViewOpen);
@@ -61,6 +63,12 @@ export function ChannelSidebar({ serverId }: { serverId: string }) {
     for (const cat of categories) out.push({ id: cat.id, name: cat.name, channels: channels.filter((c) => c.category_id === cat.id) });
     return out;
   }, [channels, categories]);
+
+  // Для канала, к которому подключены мы сами, состав берётся из LiveKit (как и счётчик в голосовом окне)
+  const liveChannelId =
+    voiceTarget?.kind === 'channel' && voiceTarget.serverId === serverId && voiceStatus === 'connected' ? voiceTarget.channelId : null;
+  const live = useMemo(() => (liveChannelId ? liveParticipants(participants) : null), [liveChannelId, participants]);
+  const voiceMembers = useMemo(() => serverRoster(presenceMembers ?? [], liveChannelId, live), [presenceMembers, liveChannelId, live]);
 
   if (!server) return null;
 
@@ -237,7 +245,7 @@ export function ChannelSidebar({ serverId }: { serverId: string }) {
                 const unread = counts[c.id];
                 const isActiveText = c.type === 'text' && c.id === activeText && !voiceViewOpen;
                 const inVoice = voiceTarget?.kind === 'channel' && voiceTarget.channelId === c.id;
-                const members = c.type === 'voice' ? voiceMembers.filter((m) => m.channel_id === c.id) : [];
+                const members = c.type === 'voice' ? channelRoster(c.id, voiceMembers, c.id === liveChannelId ? live : null) : [];
                 return (
                   <div key={c.id}>
                     <div

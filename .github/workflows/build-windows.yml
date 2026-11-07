@@ -39,6 +39,9 @@ jobs:
       - name: Test database migrations and RLS policies
         run: npm run test:sql
 
+      - name: Unit tests (voice, presence, file transfer)
+        run: npm test
+
       # Публичные параметры клиента задаются в Settings → Secrets and variables → Actions → Variables.
       # Секреты LiveKit сюда НЕ передаются — они хранятся только в Supabase Edge Functions.
       - name: Build installer

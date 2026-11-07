@@ -15,7 +15,7 @@ create function auth.uid() returns uuid language sql stable as $$ select nullif(
 grant usage on schema auth, storage, realtime, public to anon, authenticated;
 grant execute on function auth.uid() to anon, authenticated;
 create table storage.buckets (id text primary key, name text, public boolean, file_size_limit bigint, allowed_mime_types text[]);
-create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text, owner uuid);
+create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text, owner uuid, metadata jsonb, created_at timestamptz default now());
 create function storage.foldername(name text) returns text[] language plpgsql immutable as $$
 declare _parts text[]; begin select string_to_array(name, '/') into _parts; return _parts[1:array_length(_parts,1)-1]; end $$;
 alter table storage.objects enable row level security;
@@ -155,7 +155,87 @@ await expectErr('B cannot upload avatar for A', () => as(B, `insert into storage
 await expectErr('B (mod) cannot upload server icon', () => as(B, `insert into storage.objects (bucket_id, name) values ('server-icons', $1)`, [`${srv}/i.png`]));
 await expectOk('A uploads server icon', () => as(A, `insert into storage.objects (bucket_id, name) values ('server-icons', $1)`, [`${srv}/i.png`]));
 await expectErr('A cannot attach foreign path', () => as(A, `insert into public.messages (channel_id, content, attachments) values ($1, 'x', $2)`, [text, JSON.stringify([{ path: `channels/${priv}/${A}/x`, name: 'x', size: 1 }])]));
+await expectErr('A cannot attach path that was never uploaded', () => as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: `channels/${text}/${A}/x.png`, name: 'x.png', size: 10, mime: 'image/png', width: 5 }])]));
+await expectOk('A uploads x.png (legacy path, reservations not enforced)', () => as(A, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, $2)`, [`channels/${text}/${A}/x.png`, JSON.stringify({ size: 10, mimetype: 'image/png' })]));
 await expectOk('A can attach own path', () => as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: `channels/${text}/${A}/x.png`, name: 'x.png', size: 10, mime: 'image/png', width: 5 }])]));
+
+// ---------- вложения v2: лимиты бесплатного тарифа, резерв, квоты, учёт трафика ----------
+const bucketLimit = async (id) => Number((await db.query('select file_size_limit from storage.buckets where id=$1', [id])).rows[0].file_size_limit);
+eq('attachments bucket limit is 50 MB (Supabase Free maximum)', await bucketLimit('attachments'), 50 * 1024 * 1024);
+eq('avatars bucket limit unchanged (5 MB)', await bucketLimit('avatars'), 5 * 1024 * 1024);
+eq('server-icons bucket limit unchanged (5 MB)', await bucketLimit('server-icons'), 5 * 1024 * 1024);
+eq('attachments bucket stays private', (await db.query(`select public from storage.buckets where id='attachments'`)).rows[0].public, false);
+eq('limits readable by users', Number((await as(B, 'select attachment_max_bytes from public.app_limits')).rows[0].attachment_max_bytes), 50 * 1024 * 1024);
+await as(B, 'update public.app_limits set attachments_total_bytes = 999999999999').catch(() => undefined);
+eq('users cannot change limits', Number((await db.query('select attachments_total_bytes from public.app_limits')).rows[0].attachments_total_bytes), 734003200);
+const reserve = (uid, kind, scope, name, size) => as(uid, 'select path, max_bytes from public.reserve_attachment($1, $2, $3, $4)', [kind, scope, name, size]);
+const r1 = (await reserve(A, 'channel', text, 'Отчёт ../../evil 2026.pdf', 1000)).rows[0];
+eq('reserved path is inside channel/user folder', r1.path.startsWith(`channels/${text}/${A}/`) && r1.path.endsWith('.pdf'), true);
+eq('reserved path has no traversal or nesting', !r1.path.includes('..') && r1.path.split('/').length === 4, true);
+eq('reserve reports max size', Number(r1.max_bytes), 50 * 1024 * 1024);
+await expectErr('reserve over 50 MB rejected', () => reserve(A, 'channel', text, 'big.iso', 50 * 1024 * 1024 + 1));
+await expectErr('reserve empty file rejected', () => reserve(A, 'channel', text, 'empty.txt', 0));
+await expectErr('C cannot reserve in foreign channel', () => reserve(C, 'channel', text, 'x.zip', 10));
+await expectErr('anon cannot reserve', () => reserve(null, 'channel', text, 'x.zip', 10));
+await expectErr('bad scope kind rejected', () => reserve(A, 'server', text, 'x.zip', 10));
+await expectErr('reserve in private channel without access rejected', () => reserve(C, 'channel', priv, 'x.zip', 10));
+eq('reservation visible only to owner', (await as(C, 'select count(*)::int n from public.attachment_uploads')).rows[0].n, 0);
+await expectErr('client cannot insert reservation directly', () => as(C, `insert into public.attachment_uploads (path, user_id, scope_kind, scope_id, declared_size) values ('dms/x/y/z', $1, 'dm', $2, 1)`, [C, text]));
+await expectOk('A uploads reserved file', () => as(A, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, $2)`, [r1.path, JSON.stringify({ size: 1000, mimetype: 'application/pdf' })]));
+const sent = (await as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2) returning attachments`, [text, JSON.stringify([{ path: r1.path, name: 'Отчёт.pdf', size: 1, mime: 'text/html', kind: 'file' }])])).rows[0].attachments[0];
+eq('size taken from storage, not from client', sent.size, 1000);
+eq('mime taken from storage, not from client', sent.mime, 'application/pdf');
+eq('reservation marked consumed after message', (await db.query('select consumed_at is not null c from public.attachment_uploads where path=$1', [r1.path])).rows[0].c, true);
+await expectErr('nested attachment path rejected', () => as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: `channels/${text}/${A}/sub/x`, name: 'x', size: 1 }])]));
+await expectErr('nested upload path rejected by storage policy', () => as(A, `insert into storage.objects (bucket_id, name) values ('attachments', $1)`, [`channels/${text}/${A}/sub/x`]));
+const rf = (await reserve(A, 'channel', text, 'Проект.zip', 2000)).rows[0];
+await as(A, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, $2)`, [rf.path, JSON.stringify({ size: 2000, mimetype: 'application/octet-stream' })]);
+const folderAtt = (await as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2) returning attachments`, [text, JSON.stringify([{ path: rf.path, name: 'Проект', size: 2000, kind: 'folder', folder: { files: 12, dirs: 3, bytes: 99999, evil: 'x' } }])])).rows[0].attachments[0];
+eq('folder attachment keeps sanitized metadata', [folderAtt.kind, folderAtt.mime, folderAtt.folder.files, folderAtt.folder.dirs, folderAtt.folder.bytes, 'evil' in folderAtt.folder], ['folder', 'application/zip', 12, 3, 99999, false]);
+// квоты
+await db.exec('update public.app_limits set user_storage_bytes = 5000');
+await expectOk('reserve within personal quota', () => reserve(A, 'channel', text, 'a.bin', 1500));
+await expectErr('personal storage quota enforced (used + pending)', () => reserve(A, 'channel', text, 'b.bin', 1600));
+await db.exec('update public.app_limits set user_storage_bytes = 157286400, attachments_total_bytes = 4000');
+await expectErr('project storage quota enforced for everyone', () => reserve(B, 'channel', text, 'c.bin', 600));
+await db.exec('update public.app_limits set attachments_total_bytes = 734003200, user_daily_upload_bytes = 6000');
+await expectErr('daily upload quota enforced', () => reserve(A, 'channel', text, 'd.bin', 2000));
+await db.exec('update public.app_limits set user_daily_upload_bytes = 262144000');
+// обязательный резерв
+await db.exec('update public.app_limits set enforce_reservations = true');
+await expectErr('upload without reservation rejected when enforced', () => as(B, `insert into storage.objects (bucket_id, name) values ('attachments', $1)`, [`channels/${text}/${B}/noreserve.bin`]));
+const rb = (await reserve(B, 'channel', text, 'ok.bin', 10)).rows[0];
+await expectErr('reservation of another user cannot be used', () => as(A, `insert into storage.objects (bucket_id, name) values ('attachments', $1)`, [rb.path]));
+await expectOk('upload with own reservation allowed when enforced', () => as(B, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, '{"size":10}')`, [rb.path]));
+await db.exec('update public.app_limits set enforce_reservations = false');
+// учёт трафика скачиваний
+const G = '00000000-0000-4000-8000-000000000001';
+await db.exec(`insert into auth.users values ('${G}','g@x','{"username":"gena","display_name":"Gena"}')`);
+await as(G, 'select public.join_server($1)', [code]);
+await expectErr('C cannot request foreign attachment', () => as(C, 'select public.request_attachment_download($1)', [r1.path]));
+await expectErr('download of missing file rejected', () => as(G, 'select public.request_attachment_download($1)', [`channels/${text}/${A}/missing.bin`]));
+await expectErr('download path traversal rejected', () => as(G, 'select public.request_attachment_download($1)', [`channels/${text}/../${A}/x`]));
+await db.exec('update public.app_limits set enforce_download_grants = true, user_month_download_bytes = 2500');
+eq('member cannot sign attachment URL without grant', (await as(G, `select count(*)::int n from storage.objects where name=$1`, [r1.path])).rows[0].n, 0);
+eq('grant returns real size', Number((await as(G, 'select public.request_attachment_download($1) s', [r1.path])).rows[0].s), 1000);
+eq('member can sign URL after grant', (await as(G, `select count(*)::int n from storage.objects where name=$1`, [r1.path])).rows[0].n, 1);
+await expectOk('repeat download within 15 min is not counted twice', () => as(G, 'select public.request_attachment_download($1)', [r1.path]));
+eq('one download logged', (await db.query('select count(*)::int n from public.attachment_downloads where user_id=$1', [G])).rows[0].n, 1);
+await expectErr('monthly personal download quota enforced', () => as(G, 'select public.request_attachment_download($1)', [rf.path]));
+eq('uploader still sees own file for deletion', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [rf.path])).rows[0].n, 1);
+await db.exec('update public.app_limits set user_month_download_bytes = 1073741824, egress_month_bytes = 1500');
+await expectErr('project monthly egress quota enforced', () => as(G, 'select public.request_attachment_download($1)', [rf.path]));
+await db.exec('update public.app_limits set egress_month_bytes = 3758096384, enforce_download_grants = false');
+eq('C still cannot see attachments', (await as(C, `select count(*)::int n from storage.objects where bucket_id='attachments'`)).rows[0].n, 0);
+// брошенные загрузки
+const orphan = `channels/${text}/${A}/orphan.bin`;
+await db.exec(`insert into storage.objects (bucket_id, name, metadata, created_at) values ('attachments', '${orphan}', '{"size":5}', now() - interval '3 hours')`);
+eq('stale upload listed for its owner', (await as(A, 'select path from public.my_stale_uploads()')).rows.map((r) => r.path).includes(orphan), true);
+eq('attached files are not stale', (await as(A, 'select path from public.my_stale_uploads()')).rows.map((r) => r.path).includes(r1.path), false);
+eq('stale uploads of others are hidden', (await as(G, 'select path from public.my_stale_uploads()')).rows.length, 0);
+const usage = (await as(A, 'select public.attachment_usage() u')).rows[0].u;
+eq('usage reports quotas', usage.max_file === 50 * 1024 * 1024 && usage.user_used >= 3000 && usage.user_limit === 157286400, true);
+await expectErr('anon cannot read usage', () => as(null, 'select public.attachment_usage()'));
 
 // realtime
 await db.exec(`select set_config('realtime.topic', 'typing:${text}', false)`);

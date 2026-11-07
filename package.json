@@ -1,7 +1,7 @@
 {
   "name": "realism-voice",
   "productName": "Realism Voice",
-  "version": "1.0.5",
+  "version": "1.1.0",
   "description": "Realism Voice — голосовой и текстовый мессенджер для Windows",
   "author": "Realism Voice",
   "license": "UNLICENSED",
@@ -23,7 +23,8 @@
     "test:release": "node scripts/test-release-publish.mjs",
     "update-key:generate": "node scripts/generate-update-key.mjs",
     "update-test:build": "node scripts/update-test.mjs build",
-    "update-test:serve": "node scripts/update-test.mjs serve"
+    "update-test:serve": "node scripts/update-test.mjs serve",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.15",
@@ -49,6 +50,7 @@
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3",
     "vite": "^6.4.5",
+    "vitest": "^3.2.4",
     "wait-on": "^8.0.5",
     "zustand": "^5.0.16"
   },

@@ -1,7 +1,9 @@
 // Preload работает в изолированном мире (contextIsolation) и песочнице (sandbox).
 // Наружу отдаётся только узкий типизированный API — без прямого доступа к ipcRenderer.
-import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
-import type { AppSettings, DeepLink, RvBridge, ScreenSource, UpdateState } from './shared';
+import { contextBridge, ipcRenderer, IpcRendererEvent, webUtils } from 'electron';
+import type {
+  AppSettings, DeepLink, DownloadProgress, PickedItem, PowerEvent, RvBridge, ScreenSource, TransferProgress, UpdateState,
+} from './shared';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
   const listener = (_e: IpcRendererEvent, payload: T) => cb(payload);
@@ -30,6 +32,7 @@ const bridge: RvBridge = {
     consumeDeepLink: () => ipcRenderer.invoke('deeplink:consume') as Promise<DeepLink | null>,
     onDeepLink: (cb) => subscribe<DeepLink>('deeplink', cb),
     onHotkey: (cb) => subscribe<'toggleMute' | 'toggleDeafen'>('hotkey', cb),
+    onPower: (cb) => subscribe<PowerEvent>('power', cb),
     quit: () => ipcRenderer.send('app:quit'),
   },
   screen: {
@@ -48,6 +51,35 @@ const bridge: RvBridge = {
     install: () => ipcRenderer.invoke('updates:install') as Promise<boolean>,
     setInCall: (inCall) => ipcRenderer.send('updates:in-call', inCall),
     onState: (cb) => subscribe<UpdateState>('updates:state', cb),
+  },
+  files: {
+    pickFiles: () => ipcRenderer.invoke('files:pick') as Promise<PickedItem[]>,
+    pickFolder: () => ipcRenderer.invoke('files:pick-folder') as Promise<PickedItem | null>,
+    // Путь можно получить только у настоящего File из события drop/input — подделать его из страницы нельзя
+    registerDropped: (files) => {
+      const paths = Array.from(files)
+        .slice(0, 10)
+        .map((f) => {
+          try {
+            return webUtils.getPathForFile(f);
+          } catch {
+            return '';
+          }
+        })
+        .filter(Boolean);
+      return ipcRenderer.invoke('files:register-dropped', paths) as Promise<PickedItem[]>;
+    },
+    release: (tokens) => ipcRenderer.invoke('files:release', tokens) as Promise<void>,
+    prepare: (id, token, maxBytes) => ipcRenderer.invoke('files:prepare', id, token, maxBytes) as Promise<{ size: number; contentType: string }>,
+    upload: (req) => ipcRenderer.invoke('files:upload', req) as Promise<void>,
+    pause: (id) => ipcRenderer.invoke('files:pause', id) as Promise<void>,
+    cancel: (id) => ipcRenderer.invoke('files:cancel', id) as Promise<void>,
+    onUploadProgress: (cb) => subscribe<TransferProgress>('files:upload-progress', cb),
+    download: (req) => ipcRenderer.invoke('files:download', req) as Promise<void>,
+    cancelDownload: (id) => ipcRenderer.invoke('files:cancel-download', id) as Promise<void>,
+    onDownloadProgress: (cb) => subscribe<DownloadProgress>('files:download-progress', cb),
+    showInFolder: (p) => ipcRenderer.invoke('files:show', p) as Promise<void>,
+    openDownloaded: (p, confirmed) => ipcRenderer.invoke('files:open', p, confirmed) as Promise<'opened' | 'needs-confirmation' | 'missing'>,
   },
 };
 

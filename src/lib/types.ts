@@ -70,6 +70,28 @@ export interface Attachment {
   mime: string;
   width?: number | null;
   height?: number | null;
+  /** 'folder' — папка, отправленная ZIP-архивом (появилось в 1.1.0) */
+  kind?: 'file' | 'folder';
+  folder?: { files: number; dirs: number; bytes: number } | null;
+  /** Только на клиенте: идентификатор задачи загрузки, пока сообщение отправляется */
+  _uploadId?: string;
+}
+
+/** Вложение, которое пользователь собирается отправить */
+export interface OutgoingItem {
+  key: string;
+  name: string;
+  size: number;
+  kind: 'file' | 'folder';
+  /** Файл или папка с диска (путь хранится в main-процессе) */
+  token?: string;
+  files?: number;
+  dirs?: number;
+  /** Вставленные из буфера данные без файла на диске */
+  blob?: File;
+  /** Объект File из перетаскивания — для превью изображений */
+  previewFile?: File;
+  mime?: string;
 }
 
 export interface Message {

@@ -1,0 +1,69 @@
+// Состояние сети и восстановление после обрыва, сна Windows или блокировки.
+// Без постоянного опроса сервера: действия выполняются только по событиям
+// (online/offline, resume из сна, возврат окна) и по редкому локальному таймеру presence.
+import { create } from 'zustand';
+import { supabase } from '@/lib/supabase';
+import { usePresence } from './presence';
+import { useVoice } from './voice';
+
+interface ConnectivityState {
+  online: boolean;
+  /** Система только что вышла из сна — идёт восстановление */
+  resuming: boolean;
+  init: () => () => void;
+  recover: (reason: string) => Promise<void>;
+}
+
+let recovering: Promise<void> | null = null;
+
+export const useConnectivity = create<ConnectivityState>((set, get) => ({
+  online: typeof navigator === 'undefined' ? true : navigator.onLine,
+  resuming: false,
+
+  init: () => {
+    const onOnline = () => {
+      set({ online: true });
+      void get().recover('online');
+    };
+    const onOffline = () => set({ online: false });
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') usePresence.getState().verify();
+    };
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    document.addEventListener('visibilitychange', onVisible);
+    const offPower = window.rv?.app.onPower?.((ev) => {
+      if (ev === 'resume' || ev === 'unlock-screen') {
+        set({ resuming: true });
+        void get().recover(ev).finally(() => set({ resuming: false }));
+      }
+    });
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+      document.removeEventListener('visibilitychange', onVisible);
+      offPower?.();
+    };
+  },
+
+  recover: async (reason) => {
+    if (recovering) return recovering;
+    recovering = (async () => {
+      if (import.meta.env.DEV) console.debug('[connectivity] recover:', reason);
+      set({ online: navigator.onLine });
+      if (!navigator.onLine) return;
+      // После сна JWT мог истечь: getSession() обновит его, и Realtime получит новый токен.
+      const { data } = await supabase.auth.getSession().catch(() => ({ data: { session: null } }));
+      if (data.session && data.session.expires_at && data.session.expires_at * 1000 < Date.now() + 60_000) {
+        await supabase.auth.refreshSession().catch(() => undefined);
+      }
+      await supabase.realtime.setAuth().catch(() => undefined);
+      if (!supabase.realtime.isConnected()) supabase.realtime.connect();
+      usePresence.getState().verify(true);
+      useVoice.getState().onConnectivityRestored();
+    })().finally(() => {
+      recovering = null;
+    });
+    return recovering;
+  },
+}));

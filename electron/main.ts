@@ -8,6 +8,7 @@ import {
   IpcMainInvokeEvent,
   Menu,
   nativeImage,
+  powerMonitor,
   protocol,
   session,
   shell,
@@ -20,6 +21,7 @@ import { loadSettings, updateSettings } from './settings';
 import * as secureStore from './secureStore';
 import { globalPttAvailable, initPtt, setPttBinding, stopHook } from './ptt';
 import { checkForUpdates, getUpdateState, initUpdater, installUpdate, setInCall, startDownload } from './updater';
+import { setupTransfers } from './transfers';
 
 // Тестовая сборка обновлений ставится рядом с рабочей и не должна перехватывать её ссылки realismvoice://
 const IS_UPDATE_TEST_BUILD = app.getName() === 'Realism Voice Update Test';
@@ -494,6 +496,15 @@ function setupIpc() {
   ipcMain.on('updates:in-call', (e, inCall) => {
     if (assertSender(e)) setInCall(inCall === true);
   });
+
+  setupTransfers(() => mainWindow, assertSender);
+}
+
+// Сон и пробуждение Windows: интерфейс восстанавливает присутствие и голосовую связь
+function setupPowerEvents() {
+  for (const ev of ['suspend', 'resume', 'lock-screen', 'unlock-screen'] as const) {
+    powerMonitor.on(ev as 'suspend', () => mainWindow?.webContents.send('power', ev));
+  }
 }
 
 // ---------- Запуск ----------
@@ -501,6 +512,7 @@ app.whenReady().then(() => {
   Menu.setApplicationMenu(null);
   setupSession();
   setupIpc();
+  setupPowerEvents();
   createTray();
   createWindow();
   const settings = loadSettings();

@@ -1,4 +1,5 @@
-import { Headphones, HeadphoneOff, Mic, MicOff, Monitor, PhoneOff, Settings, Signal, Video, VideoOff } from 'lucide-react';
+import { Headphones, HeadphoneOff, Mic, MicOff, Monitor, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff } from 'lucide-react';
+import { TONE_TEXT, VOICE_STATUS_UI } from '@/components/voice/voiceStatusUi';
 import { ConnectionQuality } from 'livekit-client';
 import { useAuth } from '@/stores/auth';
 import { useVoice } from '@/stores/voice';
@@ -28,17 +29,17 @@ function VoiceStatus() {
   const camera = useVoice((s) => s.camera);
   const screen = useVoice((s) => s.screen);
   const v = useVoice.getState();
-  if (!target && status !== 'error') return null;
+  if (!target && status !== 'error' && status !== 'lost') return null;
   const q = QUALITY[quality];
+  const tone = VOICE_STATUS_UI[status].tone;
+  const failed = status === 'error' || status === 'lost';
   return (
     <div className="border-b border-white/5 px-3 py-2.5">
       <div className="flex items-center gap-2">
-        <Signal className={`h-4 w-4 ${status === 'connected' ? q.color : status === 'error' ? 'text-rose-400' : 'animate-pulse text-amber-400'}`} />
+        <Signal className={`h-4 w-4 ${status === 'connected' ? q.color : failed ? 'text-rose-400' : 'animate-pulse text-amber-400'}`} />
         <div className="min-w-0 flex-1">
-          <div className={`flex items-baseline justify-between gap-2 text-sm font-semibold ${status === 'connected' ? 'text-emerald-400' : status === 'error' ? 'text-rose-400' : 'text-amber-300'}`}>
-            <span className="truncate">
-              {status === 'connected' ? 'Голосовая связь' : status === 'connecting' ? 'Подключение…' : status === 'reconnecting' ? 'Переподключение…' : 'Нет соединения'}
-            </span>
+          <div className={`flex items-baseline justify-between gap-2 text-sm font-semibold ${status === 'connected' ? 'text-emerald-400' : TONE_TEXT[tone]}`}>
+            <span className="truncate">{status === 'connected' ? 'Голосовая связь' : VOICE_STATUS_UI[status].label}</span>
             <CallTimer className="shrink-0 text-xs" />
           </div>
           <button
@@ -54,9 +55,14 @@ function VoiceStatus() {
               }
             }}
           >
-            {status === 'error' ? error : target?.name}
+            {failed ? error : target?.name}
           </button>
         </div>
+        {failed && target && (
+          <button className="icon-btn text-amber-200 hover:bg-white/10" title="Переподключиться" onClick={() => void v.retry()}>
+            <RefreshCw className="h-4 w-4" />
+          </button>
+        )}
         <button className="icon-btn text-rose-300 hover:bg-rose-500/20" title="Отключиться" onClick={() => void v.leave()}>
           <PhoneOff className="h-4 w-4" />
         </button>

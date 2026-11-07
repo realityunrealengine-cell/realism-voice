@@ -1,5 +1,9 @@
 // Голосовая связь, видео и демонстрация экрана через LiveKit (WebRTC SFU).
 // Токен доступа выдаёт Edge Function livekit-token после проверки прав в базе.
+//
+// Состояния: idle → connecting → connected ⇄ reconnecting → lost (соединение потеряно) / error (не удалось подключиться).
+// Каждое подключение имеет «поколение» (ConnectionGeneration): если пользователь вышел или переключил канал,
+// пока шло подключение, устаревшая комната разрывается, а не остаётся «призраком» в канале.
 import { create } from 'zustand';
 import {
   ConnectionQuality,
@@ -18,6 +22,8 @@ import { supabase } from '@/lib/supabase';
 import { functionErrorMessage } from '@/lib/errors';
 import { VoiceGate } from '@/lib/voiceGate';
 import { sounds } from '@/lib/sounds';
+import { ConnectionGeneration, StaleConnectionError, nextReconnect } from '@/lib/reconnectPolicy';
+import type { LiveParticipant } from '@/lib/voiceRoster';
 import { useSettings } from './settings';
 import { usePresence } from './presence';
 import { useMessages } from './messages';
@@ -37,14 +43,17 @@ export interface ParticipantView {
   camera: Track | null;
   screen: Track | null;
   hasScreenAudio: boolean;
+  joinedAt: number | null;
 }
 
-type Status = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'lost' | 'error';
 
 interface VoiceState {
-  status: Status;
+  status: VoiceStatus;
   target: VoiceTarget | null;
   error: string | null;
+  /** Почему пользователь отключён без своего участия (показывается в голосовом окне) */
+  notice: string | null;
   canSpeak: boolean;
   participants: ParticipantView[];
   muted: boolean;
@@ -57,8 +66,11 @@ interface VoiceState {
   pttPressed: boolean;
   /** Начало разговора; при переподключении не сбрасывается */
   connectedAt: number | null;
+  /** Номер попытки восстановления (для интерфейса) */
+  reconnectAttempt: number;
   join: (target: VoiceTarget) => Promise<void>;
   leave: () => Promise<void>;
+  retry: () => Promise<void>;
   toggleMute: () => void;
   toggleDeafen: () => void;
   toggleCamera: () => Promise<void>;
@@ -67,15 +79,19 @@ interface VoiceState {
   setPtt: (pressed: boolean) => void;
   applyPrefs: () => Promise<void>;
   applyVolumes: () => void;
+  /** Сеть или система вернулись (resume/online): проверить комнату */
+  onConnectivityRestored: () => void;
 }
 
 let room: Room | null = null;
 let gate: VoiceGate | null = null;
 let audioCtx: AudioContext | null = null;
 let audioHost: HTMLDivElement | null = null;
-let intentionalLeave = false;
-let reconnectAttempts = 0;
 let lastLevelPush = 0;
+const generation = new ConnectionGeneration();
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectStartedAt = 0;
+let networkWaiter: (() => void) | null = null;
 
 function host(): HTMLDivElement {
   if (!audioHost) {
@@ -125,6 +141,18 @@ function mediaErrorMessage(e: unknown): string {
   return (e as Error)?.message || 'Ошибка устройства';
 }
 
+function sameTarget(a: VoiceTarget | null, b: VoiceTarget | null): boolean {
+  if (!a || !b) return false;
+  if (a.kind === 'channel' && b.kind === 'channel') return a.channelId === b.channelId;
+  if (a.kind === 'dm' && b.kind === 'dm') return a.dmId === b.dmId;
+  return false;
+}
+
+/** Участники комнаты LiveKit в формате списка голосового канала */
+export function liveParticipants(list: ParticipantView[]): LiveParticipant[] {
+  return list.map((p) => ({ identity: p.identity, micMuted: p.micMuted, camera: !!p.camera, screen: !!p.screen, joinedAt: p.joinedAt }));
+}
+
 export const useVoice = create<VoiceState>((set, get) => {
   const sync = () => {
     if (!room) {
@@ -146,6 +174,7 @@ export const useVoice = create<VoiceState>((set, get) => {
         camera: cam && !cam.isMuted && cam.track ? cam.track : null,
         screen: scr && !scr.isMuted && scr.track ? scr.track : null,
         hasScreenAudio: !!scrAudio?.track,
+        joinedAt: p.joinedAt ? p.joinedAt.getTime() : isLocal ? get().connectedAt : null,
       });
     };
     add(room.localParticipant, true);
@@ -207,8 +236,51 @@ export const useVoice = create<VoiceState>((set, get) => {
     if (get().muted) await track.mute();
   };
 
-  const connect = async (target: VoiceTarget) => {
+  const clearReconnect = () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    if (networkWaiter) window.removeEventListener('online', networkWaiter);
+    networkWaiter = null;
+  };
+
+  const cleanupRoom = () => {
+    gate = null;
+    if (audioHost) audioHost.innerHTML = '';
+    room?.removeAllListeners();
+    room = null;
+    window.rv?.ptt.setActive(false);
+  };
+
+  const updatePtt = () => {
+    const prefs = useSettings.getState().prefs;
+    const active = !!room && prefs.voiceMode === 'ptt';
+    if (active) void useSettings.getState().setApp({ ptt: prefs.pttBinding });
+    window.rv?.ptt.setActive(active);
+  };
+
+  /** Отключение не по воле пользователя, без автоматического повтора */
+  const endExternally = (notice: string) => {
+    generation.invalidate();
+    clearReconnect();
+    cleanupRoom();
+    set({ status: 'idle', target: null, participants: [], connectedAt: null, camera: false, screen: false, transmitting: false, notice, reconnectAttempt: 0 });
+    pushPresence();
+    toast.info(notice);
+  };
+
+  const connect = async (target: VoiceTarget, gen: number) => {
+    const ensureCurrent = async (r: Room | null) => {
+      if (generation.isCurrent(gen)) return;
+      if (r) {
+        r.removeAllListeners();
+        if (room === r) room = null;
+        await r.disconnect().catch(() => undefined);
+      }
+      throw new StaleConnectionError();
+    };
+
     const { token, url, can_speak } = await fetchToken(target);
+    await ensureCurrent(null);
     audioCtx ??= new AudioContext({ latencyHint: 'interactive' });
     if (audioCtx.state === 'suspended') await audioCtx.resume();
     const prefs = useSettings.getState().prefs;
@@ -221,9 +293,11 @@ export const useVoice = create<VoiceState>((set, get) => {
       audioOutput: prefs.outputDeviceId && prefs.outputDeviceId !== 'default' ? { deviceId: prefs.outputDeviceId } : undefined,
       publishDefaults: { dtx: true, red: true, screenShareEncoding: screenPreset().encoding },
     });
+    // Комната становится текущей до connect(): дорожки, подписанные во время подключения, должны прикрепиться
     room = r;
 
     r.on(RoomEvent.TrackSubscribed, (track: RemoteTrack, _pub, participant: RemoteParticipant) => {
+      if (room !== r) return;
       if (track.kind === Track.Kind.Audio) {
         const el = track.attach();
         el.dataset.identity = participant.identity;
@@ -234,14 +308,16 @@ export const useVoice = create<VoiceState>((set, get) => {
     });
     r.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
       track.detach().forEach((el) => el.remove());
-      sync();
+      if (room === r) sync();
     });
     r.on(RoomEvent.ParticipantConnected, (p) => {
+      if (room !== r) return;
       sounds.join();
       applyRemoteVolume(p);
       sync();
     });
     r.on(RoomEvent.ParticipantDisconnected, () => {
+      if (room !== r) return;
       sounds.leave();
       sync();
     });
@@ -250,9 +326,10 @@ export const useVoice = create<VoiceState>((set, get) => {
       RoomEvent.TrackPublished, RoomEvent.TrackUnpublished, RoomEvent.ActiveSpeakersChanged, RoomEvent.ConnectionQualityChanged,
       RoomEvent.ParticipantNameChanged,
     ] as const) {
-      r.on(ev, () => sync());
+      r.on(ev, () => room === r && sync());
     }
     r.on(RoomEvent.LocalTrackUnpublished, (pub) => {
+      if (room !== r) return;
       if (pub.source === Track.Source.ScreenShare) {
         set({ screen: false });
         pushPresence();
@@ -262,26 +339,32 @@ export const useVoice = create<VoiceState>((set, get) => {
         pushPresence();
       }
     });
-    r.on(RoomEvent.Reconnecting, () => set({ status: 'reconnecting' }));
+    // Короткие сбои LiveKit восстанавливает сам — показываем «Переподключение», присутствие сохраняем
+    r.on(RoomEvent.Reconnecting, () => room === r && set({ status: 'reconnecting' }));
     r.on(RoomEvent.Reconnected, () => {
-      set({ status: 'connected' });
+      if (room !== r) return;
+      set({ status: 'connected', reconnectAttempt: 0 });
+      sync();
       pushPresence();
     });
     r.on(RoomEvent.MediaDevicesError, (e) => toast.error('Ошибка устройства', mediaErrorMessage(e)));
     r.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
-      if (room !== r) return;
+      if (room !== r || !generation.isCurrent(gen)) return;
       cleanupRoom();
-      if (intentionalLeave) return;
-      if (reason === DisconnectReason.PARTICIPANT_REMOVED || reason === DisconnectReason.ROOM_DELETED) {
-        set({ status: 'idle', target: null, connectedAt: null });
-        toast.info('Вы отключены от голосового канала');
-        pushPresence();
+      if (reason === DisconnectReason.CLIENT_INITIATED) return;
+      if (reason === DisconnectReason.DUPLICATE_IDENTITY) {
+        endExternally('Вы подключились к голосовой связи с другого устройства — здесь соединение закрыто');
         return;
       }
-      void reconnect(target);
+      if (reason === DisconnectReason.PARTICIPANT_REMOVED || reason === DisconnectReason.ROOM_DELETED) {
+        endExternally('Вы отключены от голосового канала');
+        return;
+      }
+      startReconnect(target);
     });
 
     await r.connect(url, token, { autoSubscribe: true });
+    await ensureCurrent(r);
     set({ canSpeak: !!can_speak });
     await r.startAudio().catch(() => undefined);
     try {
@@ -290,51 +373,84 @@ export const useVoice = create<VoiceState>((set, get) => {
       toast.error('Микрофон недоступен', mediaErrorMessage(e));
       set({ muted: true });
     }
+    await ensureCurrent(r);
     for (const p of r.remoteParticipants.values()) applyRemoteVolume(p);
     sync();
   };
 
-  const cleanupRoom = () => {
-    gate = null;
-    if (audioHost) audioHost.innerHTML = '';
-    room?.removeAllListeners();
-    room = null;
-    window.rv?.ptt.setActive(false);
+  const giveUp = () => {
+    clearReconnect();
+    generation.invalidate();
+    cleanupRoom();
+    set({
+      status: 'lost',
+      error: 'Соединение с голосовым сервером потеряно. Проверьте интернет и нажмите «Переподключиться».',
+      participants: [],
+      connectedAt: null,
+      camera: false,
+      screen: false,
+      transmitting: false,
+      reconnectAttempt: 0,
+    });
+    // Окончательно потерянное соединение — убираем себя из списка участников у остальных
+    pushPresence();
   };
 
-  const reconnect = async (target: VoiceTarget) => {
-    if (reconnectAttempts >= 3) {
-      set({ status: 'error', error: 'Соединение с голосовым сервером потеряно', participants: [], connectedAt: null });
-      reconnectAttempts = 0;
-      pushPresence();
+  const scheduleAttempt = (target: VoiceTarget) => {
+    const attempt = get().reconnectAttempt;
+    const d = nextReconnect(attempt, reconnectStartedAt, Date.now(), navigator.onLine);
+    if (d.action === 'give-up') {
+      giveUp();
       return;
     }
-    reconnectAttempts++;
-    set({ status: 'reconnecting', participants: [] });
-    await new Promise((r) => setTimeout(r, 1000 * reconnectAttempts));
-    if (get().target !== target) return;
-    try {
-      await connect(target);
-      reconnectAttempts = 0;
-      set({ status: 'connected', error: null });
-      updatePtt();
-      pushPresence();
-    } catch {
-      void reconnect(target);
+    if (d.action === 'wait-network') {
+      networkWaiter = () => {
+        clearReconnect();
+        scheduleAttempt(target);
+      };
+      window.addEventListener('online', networkWaiter);
+      reconnectTimer = setTimeout(() => {
+        clearReconnect();
+        giveUp();
+      }, d.delayMs);
+      return;
     }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!sameTarget(get().target, target) || get().status !== 'reconnecting') return;
+      const gen = generation.next();
+      set({ reconnectAttempt: attempt + 1 });
+      connect(target, gen)
+        .then(() => {
+          if (!generation.isCurrent(gen)) return;
+          set({ status: 'connected', error: null, reconnectAttempt: 0 });
+          updatePtt();
+          pushPresence();
+        })
+        .catch((e) => {
+          if (e instanceof StaleConnectionError || !generation.isCurrent(gen)) return;
+          const failed = room;
+          cleanupRoom();
+          void failed?.disconnect().catch(() => undefined);
+          scheduleAttempt(target);
+        });
+    }, d.delayMs);
   };
 
-  const updatePtt = () => {
-    const prefs = useSettings.getState().prefs;
-    const active = !!room && prefs.voiceMode === 'ptt';
-    if (active) void useSettings.getState().setApp({ ptt: prefs.pttBinding });
-    window.rv?.ptt.setActive(active);
+  const startReconnect = (target: VoiceTarget) => {
+    clearReconnect();
+    reconnectStartedAt = Date.now();
+    set({ status: 'reconnecting', reconnectAttempt: 0, camera: false, screen: false, transmitting: false });
+    sync();
+    // Присутствие оставляем: при быстром восстановлении у других не будет «мигания»
+    scheduleAttempt(target);
   };
 
   return {
     status: 'idle',
     target: null,
     error: null,
+    notice: null,
     canSpeak: true,
     participants: [],
     muted: false,
@@ -346,22 +462,20 @@ export const useVoice = create<VoiceState>((set, get) => {
     quality: ConnectionQuality.Unknown,
     pttPressed: false,
     connectedAt: null,
+    reconnectAttempt: 0,
 
     join: async (target) => {
-      const cur = get().target;
-      const same =
-        cur &&
-        ((cur.kind === 'channel' && target.kind === 'channel' && cur.channelId === target.channelId) ||
-          (cur.kind === 'dm' && target.kind === 'dm' && cur.dmId === target.dmId));
-      if (same && (get().status === 'connected' || get().status === 'connecting')) return;
-      if (room) await get().leave();
-      intentionalLeave = false;
-      reconnectAttempts = 0;
-      set({ status: 'connecting', target, error: null, camera: false, screen: false, transmitting: false, connectedAt: null });
+      const s = get();
+      if (sameTarget(s.target, target) && (s.status === 'connected' || s.status === 'connecting' || s.status === 'reconnecting')) return;
+      if (room || s.target) await get().leave();
+      const gen = generation.next();
+      set({ status: 'connecting', target, error: null, notice: null, camera: false, screen: false, transmitting: false, connectedAt: null, reconnectAttempt: 0 });
+      pushPresence();
       try {
-        await connect(target);
-        if (get().target !== target) return;
+        await connect(target, gen);
+        if (!generation.isCurrent(gen)) return;
         set({ status: 'connected', connectedAt: Date.now() });
+        sync();
         sounds.join();
         updatePtt();
         pushPresence();
@@ -370,25 +484,41 @@ export const useVoice = create<VoiceState>((set, get) => {
           void useMessages.getState().send({ kind: 'dm', id: target.dmId }, '', [], null, 'call').catch(() => undefined);
         }
       } catch (e) {
+        if (e instanceof StaleConnectionError || !generation.isCurrent(gen)) return;
         const msg = e instanceof Error ? e.message : String(e);
-        intentionalLeave = true;
-        await room?.disconnect().catch(() => undefined);
+        generation.invalidate();
+        const r = room;
         cleanupRoom();
+        await r?.disconnect().catch(() => undefined);
         set({ status: 'error', error: msg, participants: [], connectedAt: null });
         pushPresence();
       }
     },
 
     leave: async () => {
-      intentionalLeave = true;
+      generation.invalidate();
+      clearReconnect();
       const r = room;
+      const wasConnected = !!r;
       cleanupRoom();
-      set({ status: 'idle', target: null, participants: [], camera: false, screen: false, transmitting: false, error: null, connectedAt: null });
+      set({ status: 'idle', target: null, participants: [], camera: false, screen: false, transmitting: false, error: null, connectedAt: null, reconnectAttempt: 0 });
       pushPresence();
       if (r) {
-        sounds.leave();
+        if (wasConnected) sounds.leave();
         await r.disconnect().catch(() => undefined);
       }
+    },
+
+    retry: async () => {
+      const t = get().target;
+      if (!t) return;
+      clearReconnect();
+      generation.invalidate();
+      const r = room;
+      cleanupRoom();
+      await r?.disconnect().catch(() => undefined);
+      set({ status: 'idle' });
+      await get().join(t);
     },
 
     toggleMute: () => {
@@ -490,6 +620,18 @@ export const useVoice = create<VoiceState>((set, get) => {
     applyVolumes: () => {
       if (!room) return;
       for (const p of room.remoteParticipants.values()) applyRemoteVolume(p);
+    },
+
+    onConnectivityRestored: () => {
+      const s = get();
+      if (!s.target) return;
+      // Комната уже разорвана, а ожидание шло без сети — пробуем сразу
+      if (s.status === 'reconnecting' && !room && networkWaiter) {
+        const w = networkWaiter;
+        w();
+        return;
+      }
+      if (s.status === 'connected' && room && room.state === 'disconnected') startReconnect(s.target);
     },
   };
 });

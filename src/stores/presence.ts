@@ -1,63 +1,86 @@
 // Онлайн-статусы и «кто в голосовом канале» через Supabase Realtime Presence.
 // Каналы приватные — доступ проверяется политиками realtime.messages (Realtime Authorization).
+// Надёжность обеспечивает SupervisedChannel: он пересоздаёт закрытые сервером каналы и восстанавливает
+// собственную запись присутствия, если сервер её потерял (обрыв сети, сон Windows, истёкший токен).
 import { create } from 'zustand';
-import type { RealtimeChannel } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
 import type { PresenceStatus } from '@/lib/types';
+import { SupervisedChannel, type RtClient } from '@/lib/presenceChannel';
+import { reduceVoicePresence, type VoiceMember, type VoicePresenceMeta } from '@/lib/voiceRoster';
+import { reduceOnline, type OnlineStatus } from '@/lib/onlineStatus';
 
-export interface VoiceMember {
-  user_id: string;
-  channel_id: string;
-  muted: boolean;
-  deafened: boolean;
-  camera: boolean;
-  screen: boolean;
-}
+export type { VoiceMember } from '@/lib/voiceRoster';
+
+export type VoiceSelfState = Omit<VoiceMember, 'user_id' | 'joined_at'>;
 
 interface PresenceState {
-  online: Record<string, Exclude<PresenceStatus, 'invisible'>>;
-  voice: Record<string, VoiceMember[]>; // serverId -> участники
+  online: Record<string, OnlineStatus>;
+  voice: Record<string, VoiceMember[]>; // serverId -> участники голосовых каналов
+  /** Канал онлайн-статусов подключён (сервер видит этот клиент) */
   connected: boolean;
   start: (userId: string, status: PresenceStatus) => void;
   setStatus: (status: PresenceStatus) => void;
-  stop: () => void;
+  stop: () => Promise<void>;
   watchVoice: (serverIds: string[]) => void;
-  trackVoice: (serverId: string | null, state: Omit<VoiceMember, 'user_id'> | null) => void;
+  trackVoice: (serverId: string | null, state: VoiceSelfState | null) => void;
+  /** Сверка и восстановление всех каналов (после сна, восстановления сети, по таймеру) */
+  verify: (force?: boolean) => void;
 }
 
-let globalChannel: RealtimeChannel | null = null;
+/** Уникален для каждого запуска приложения: отличает наши записи от записей других устройств */
+const SESSION = crypto.randomUUID();
+const WATCHDOG_MS = 20_000;
+const client = supabase as unknown as RtClient;
+
+let globalCh: SupervisedChannel | null = null;
 let myId: string | null = null;
 let myStatus: PresenceStatus = 'online';
-const voiceChannels = new Map<string, RealtimeChannel>();
-let trackedVoice: { serverId: string; state: Omit<VoiceMember, 'user_id'> } | null = null;
+let wantedVoice: string[] = [];
+const voiceChannels = new Map<string, SupervisedChannel>();
+let trackedVoice: { serverId: string; state: VoiceSelfState; joinedAt: number } | null = null;
+let watchdog: ReturnType<typeof setInterval> | null = null;
+
+const log = (msg: string) => {
+  if (import.meta.env.DEV) console.debug('[presence]', msg);
+};
 
 export const usePresence = create<PresenceState>((set, get) => {
-  const syncVoice = (serverId: string, ch: RealtimeChannel) => {
-    const state = ch.presenceState<VoiceMember>();
-    const list: VoiceMember[] = [];
-    const seen = new Set<string>();
-    for (const metas of Object.values(state)) {
-      const m = metas[metas.length - 1];
-      if (m && m.user_id && !seen.has(m.user_id)) {
-        seen.add(m.user_id);
-        list.push({
-          user_id: m.user_id, channel_id: m.channel_id, muted: !!m.muted, deafened: !!m.deafened, camera: !!m.camera, screen: !!m.screen,
-        });
-      }
-    }
-    set({ voice: { ...get().voice, [serverId]: list } });
-  };
+  const globalPayload = () =>
+    myId && myStatus !== 'invisible' ? { user_id: myId, status: myStatus, at: Date.now() } : null;
+
+  const voicePayload = (serverId: string) =>
+    myId && trackedVoice?.serverId === serverId
+      ? { user_id: myId, ...trackedVoice.state, joined_at: trackedVoice.joinedAt, at: Date.now() }
+      : null;
 
   const openVoice = (serverId: string) => {
-    if (voiceChannels.has(serverId)) return;
-    const ch = supabase.channel(`voice:${serverId}`, { config: { private: true, presence: { key: myId ?? undefined } } });
-    ch.on('presence', { event: 'sync' }, () => syncVoice(serverId, ch));
-    ch.subscribe((status) => {
-      if (status === 'SUBSCRIBED' && trackedVoice?.serverId === serverId && myId) {
-        void ch.track({ user_id: myId, ...trackedVoice.state });
-      }
+    if (!myId || voiceChannels.has(serverId)) return;
+    const ch = new SupervisedChannel({
+      client,
+      topic: `voice:${serverId}`,
+      key: myId,
+      session: SESSION,
+      log,
+      onSync: (state) => set({ voice: { ...get().voice, [serverId]: reduceVoicePresence(state as Record<string, VoicePresenceMeta[]>) } }),
     });
     voiceChannels.set(serverId, ch);
+    ch.setPayload(voicePayload(serverId));
+    ch.start();
+  };
+
+  const applyVoiceWatch = () => {
+    if (!myId) return;
+    const wanted = new Set(wantedVoice.filter(Boolean));
+    if (trackedVoice) wanted.add(trackedVoice.serverId);
+    for (const [id, ch] of voiceChannels) {
+      if (!wanted.has(id)) {
+        voiceChannels.delete(id);
+        void ch.stop();
+        const { [id]: _x, ...rest } = get().voice;
+        set({ voice: rest });
+      }
+    }
+    for (const id of wanted) openVoice(id);
   };
 
   return {
@@ -66,68 +89,70 @@ export const usePresence = create<PresenceState>((set, get) => {
     connected: false,
 
     start: (userId, status) => {
+      if (myId && myId !== userId) void get().stop();
       myId = userId;
       myStatus = status;
-      if (globalChannel) return;
-      globalChannel = supabase.channel('presence:global', { config: { private: true, presence: { key: userId } } });
-      globalChannel.on('presence', { event: 'sync' }, () => {
-        const state = globalChannel!.presenceState<{ user_id: string; status: PresenceStatus }>();
-        const online: PresenceState['online'] = {};
-        for (const metas of Object.values(state)) {
-          const m = metas[metas.length - 1];
-          if (m?.user_id && m.status !== 'invisible') online[m.user_id] = m.status as Exclude<PresenceStatus, 'invisible'>;
-        }
-        set({ online });
-      });
-      globalChannel.subscribe((s) => {
-        set({ connected: s === 'SUBSCRIBED' });
-        if (s === 'SUBSCRIBED' && myStatus !== 'invisible') {
-          void globalChannel!.track({ user_id: userId, status: myStatus });
-        }
-      });
+      if (!globalCh) {
+        globalCh = new SupervisedChannel({
+          client,
+          topic: 'presence:global',
+          key: userId,
+          session: SESSION,
+          log,
+          onSync: (state) => set({ online: reduceOnline(state) }),
+          onJoinedChange: (joined) => set({ connected: joined }),
+        });
+        globalCh.setPayload(globalPayload());
+        globalCh.start();
+      }
+      applyVoiceWatch();
+      watchdog ??= setInterval(() => get().verify(), WATCHDOG_MS);
     },
 
     setStatus: (status) => {
+      if (status === myStatus) return;
       myStatus = status;
-      if (!globalChannel || !myId) return;
-      if (status === 'invisible') void globalChannel.untrack();
-      else void globalChannel.track({ user_id: myId, status });
+      globalCh?.setPayload(globalPayload());
     },
 
-    stop: () => {
-      if (globalChannel) void supabase.removeChannel(globalChannel);
-      globalChannel = null;
-      for (const ch of voiceChannels.values()) void supabase.removeChannel(ch);
+    stop: async () => {
+      if (watchdog) clearInterval(watchdog);
+      watchdog = null;
+      const all = [globalCh, ...voiceChannels.values()].filter((c): c is SupervisedChannel => !!c);
+      globalCh = null;
       voiceChannels.clear();
       trackedVoice = null;
       myId = null;
       set({ online: {}, voice: {}, connected: false });
+      await Promise.all(all.map((c) => c.stop()));
     },
 
     watchVoice: (serverIds) => {
-      const wanted = new Set(serverIds.filter(Boolean));
-      if (trackedVoice) wanted.add(trackedVoice.serverId);
-      for (const [id, ch] of voiceChannels) {
-        if (!wanted.has(id)) {
-          void supabase.removeChannel(ch);
-          voiceChannels.delete(id);
-          const { [id]: _x, ...rest } = get().voice;
-          set({ voice: rest });
-        }
-      }
-      for (const id of wanted) openVoice(id);
+      wantedVoice = serverIds;
+      applyVoiceWatch();
     },
 
     trackVoice: (serverId, state) => {
       const prev = trackedVoice;
-      if (prev && (!serverId || prev.serverId !== serverId)) {
-        void voiceChannels.get(prev.serverId)?.untrack();
+      if (serverId && state) {
+        const same = prev?.serverId === serverId && prev.state.channel_id === state.channel_id;
+        trackedVoice = { serverId, state, joinedAt: same ? prev!.joinedAt : Date.now() };
+      } else {
+        trackedVoice = null;
       }
-      trackedVoice = serverId && state ? { serverId, state } : null;
-      if (serverId && state && myId) {
+      if (prev && prev.serverId !== serverId) voiceChannels.get(prev.serverId)?.setPayload(null);
+      if (serverId) {
         const ch = voiceChannels.get(serverId);
-        if (ch) void ch.track({ user_id: myId, ...state });
-        else openVoice(serverId);
+        if (ch) ch.setPayload(voicePayload(serverId));
+      }
+      applyVoiceWatch();
+    },
+
+    verify: (force = false) => {
+      for (const ch of [globalCh, ...voiceChannels.values()]) {
+        if (!ch) continue;
+        if (force && !ch.isJoined) ch.reconnectNow();
+        else ch.check();
       }
     },
   };

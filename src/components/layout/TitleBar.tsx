@@ -3,6 +3,8 @@ import { LogoMark } from '@/components/ui/Logo';
 import { useVoice } from '@/stores/voice';
 import { useUpdates } from '@/stores/updates';
 import { CallTimer } from '@/components/voice/CallTimer';
+import { TONE_DOT, TONE_PILL, VOICE_STATUS_UI } from '@/components/voice/voiceStatusUi';
+import { NetworkIndicator } from './NetworkIndicator';
 
 // Перетаскиваемая область окна. Справа — системные кнопки (titleBarOverlay Electron).
 export function TitleBar() {
@@ -14,16 +16,13 @@ export function TitleBar() {
       <LogoMark size={18} />
       <span className="text-xs font-semibold tracking-wide text-slate-300">Realism Voice</span>
       {target && status !== 'idle' && (
-        <span
-          className={`ml-3 flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ${
-            status === 'connected' ? 'bg-emerald-500/15 text-emerald-300' : status === 'error' ? 'bg-rose-500/15 text-rose-300' : 'bg-amber-500/15 text-amber-300'
-          }`}
-        >
-          <span className={`h-1.5 w-1.5 rounded-full ${status === 'connected' ? 'bg-emerald-400' : status === 'error' ? 'bg-rose-400' : 'animate-pulse bg-amber-400'}`} />
-          {status === 'connected' ? 'Голосовая связь' : status === 'error' ? 'Ошибка связи' : 'Подключение…'} · {target.name}
+        <span className={`ml-3 flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] ${TONE_PILL[VOICE_STATUS_UI[status].tone]}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${TONE_DOT[VOICE_STATUS_UI[status].tone]}`} />
+          {status === 'connected' ? 'Голосовая связь' : VOICE_STATUS_UI[status].label} · {target.name}
           <CallTimer className="font-semibold" />
         </span>
       )}
+      <NetworkIndicator />
       {(updatePhase === 'available' || updatePhase === 'downloaded') && (
         <button
           className="no-drag ml-auto flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-300 hover:bg-emerald-500/25"
