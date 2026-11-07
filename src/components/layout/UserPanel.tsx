@@ -1,5 +1,6 @@
 import { Headphones, HeadphoneOff, Mic, MicOff, Monitor, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff } from 'lucide-react';
 import { TONE_TEXT, VOICE_STATUS_UI } from '@/components/voice/voiceStatusUi';
+import { useSyncView } from '@/stores/connectivity';
 import { ConnectionQuality } from 'livekit-client';
 import { useAuth } from '@/stores/auth';
 import { useVoice } from '@/stores/voice';
@@ -88,7 +89,8 @@ export function UserPanel() {
   const profile = useAuth((s) => s.profile);
   const muted = useVoice((s) => s.muted);
   const deafened = useVoice((s) => s.deafened);
-  const connected = usePresence((s) => s.connected);
+  // Связь с сервером (статусы, сообщения) — не голосовая связь: у голоса свой индикатор выше
+  const sync = useSyncView();
   const voice = useVoice.getState();
   if (!profile) return null;
 
@@ -124,8 +126,11 @@ export function UserPanel() {
               <span className="truncate text-sm font-semibold text-white">{profile.display_name}</span>
               <UserBadge userId={profile.id} tag={false} />
             </div>
-            <div className="truncate text-xs text-slate-400">
-              {!connected ? 'Нет соединения…' : profile.custom_status || `@${profile.username}`}
+            <div
+              className={`truncate text-xs ${sync.state === 'offline' ? 'text-rose-300' : sync.state === 'syncing' ? 'text-amber-300' : 'text-slate-400'}`}
+              title={sync.detail ?? undefined}
+            >
+              {sync.label ?? (profile.custom_status || `@${profile.username}`)}
             </div>
           </div>
         </button>

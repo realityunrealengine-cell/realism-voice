@@ -102,23 +102,31 @@ export async function requestDownload(path: string): Promise<void> {
   if (error && !isMissingFunction(error)) throw new Error(error.message);
 }
 
-export async function signedUrl(path: string, opts: { count?: boolean } = {}): Promise<string | null> {
-  const cached = signedCache.get(path);
-  if (cached && cached.expires > Date.now() + 60_000) return cached.url;
-  const existing = inflight.get(path);
+/**
+ * Срок подписанной ссылки. Ссылкой можно пользоваться повторно, пока она действует, поэтому срок
+ * короткий: скачивание и превью начинаются сразу. Видео дольше — плеер дозагружает его частями.
+ */
+export const SIGNED_URL_TTL = { download: 120, preview: 120, video: 900 } as const;
+
+export async function signedUrl(path: string, opts: { count?: boolean; ttl?: number } = {}): Promise<string | null> {
+  const ttl = opts.ttl ?? SIGNED_URL_TTL.download;
+  const key = `${path}|${ttl}`;
+  const cached = signedCache.get(key);
+  if (cached && cached.expires > Date.now() + 30_000) return cached.url;
+  const existing = inflight.get(key);
   if (existing) return existing;
   const p = (async () => {
     try {
       if (opts.count !== false) await requestDownload(path);
-      const { data, error } = await supabase.storage.from('attachments').createSignedUrl(path, 600);
+      const { data, error } = await supabase.storage.from('attachments').createSignedUrl(path, ttl);
       if (error || !data) return null;
-      signedCache.set(path, { url: data.signedUrl, expires: Date.now() + 600_000 });
+      signedCache.set(key, { url: data.signedUrl, expires: Date.now() + ttl * 1000 });
       return data.signedUrl;
     } finally {
-      inflight.delete(path);
+      inflight.delete(key);
     }
   })();
-  inflight.set(path, p);
+  inflight.set(key, p);
   return p;
 }
 

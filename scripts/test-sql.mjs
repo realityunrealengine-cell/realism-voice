@@ -222,7 +222,18 @@ eq('member can sign URL after grant', (await as(G, `select count(*)::int n from 
 await expectOk('repeat download within 15 min is not counted twice', () => as(G, 'select public.request_attachment_download($1)', [r1.path]));
 eq('one download logged', (await db.query('select count(*)::int n from public.attachment_downloads where user_id=$1', [G])).rows[0].n, 1);
 await expectErr('monthly personal download quota enforced', () => as(G, 'select public.request_attachment_download($1)', [rf.path]));
-eq('uploader still sees own file for deletion', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [rf.path])).rows[0].n, 1);
+eq('uploader cannot sign own ATTACHED file without counted grant', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [rf.path])).rows[0].n, 0);
+{
+  await db.exec('update public.app_limits set user_month_download_bytes = 1073741824');
+  const own = (await reserve(A, 'channel', text, 'own.bin', 50)).rows[0];
+  await as(A, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, '{"size": 50}')`, [own.path]);
+  const ownMsg = (await as(A, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2) returning id`, [text, JSON.stringify([{ path: own.path, name: 'own.bin', size: 50 }])])).rows[0].id;
+  eq('author does not see own attached file without grant', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [own.path])).rows[0].n, 0);
+  await expectOk('author deletes the message', () => as(A, 'select public.delete_message($1)', [ownMsg]));
+  eq('after message deletion the author sees the file again (to delete it)', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [own.path])).rows[0].n, 1);
+  await expectOk('author deletes the now-unattached file', () => as(A, `delete from storage.objects where name=$1`, [own.path]));
+  await db.exec('update public.app_limits set user_month_download_bytes = 2500');
+}
 await db.exec('update public.app_limits set user_month_download_bytes = 1073741824, egress_month_bytes = 1500');
 await expectErr('project monthly egress quota enforced', () => as(G, 'select public.request_attachment_download($1)', [rf.path]));
 await db.exec('update public.app_limits set egress_month_bytes = 3758096384, enforce_download_grants = false');
@@ -233,6 +244,59 @@ await db.exec(`insert into storage.objects (bucket_id, name, metadata, created_a
 eq('stale upload listed for its owner', (await as(A, 'select path from public.my_stale_uploads()')).rows.map((r) => r.path).includes(orphan), true);
 eq('attached files are not stale', (await as(A, 'select path from public.my_stale_uploads()')).rows.map((r) => r.path).includes(r1.path), false);
 eq('stale uploads of others are hidden', (await as(G, 'select path from public.my_stale_uploads()')).rows.length, 0);
+// ---------- ревизия 2: обход квот фактическим размером, чужие файлы, исключения ----------
+const putObj = (uid, name, size) => as(uid, `insert into storage.objects (bucket_id, name, metadata) values ('attachments', $1, $2)`, [name, size == null ? null : JSON.stringify({ size, mimetype: 'application/octet-stream' })]);
+const small = (await reserve(B, 'channel', text, 'tiny.bin', 100)).rows[0];
+await expectOk('pre-upload permission check without size passes', () => as(B, `select public.attachment_upload_allowed($1, null) ok`, [small.path]).then((r) => { if (!r.rows[0].ok) throw new Error('denied'); }));
+eq('pre-upload check with declared size above reservation denied', (await as(B, `select public.attachment_upload_allowed($1, '{"contentLength": 5000}') ok`, [small.path])).rows[0].ok, false);
+await expectErr('BYPASS: reserve 100 B, upload 40 MB — rejected by storage policy', () => putObj(B, small.path, 40 * 1024 * 1024));
+await expectErr('BYPASS: reserve 100 B, upload 101 B — rejected', () => putObj(B, small.path, 101));
+await expectOk('upload exactly the reserved size allowed', () => putObj(B, small.path, 100));
+// второй рубеж: объект больше резерва, записанный в обход политики (например, сервисной ролью)
+const sneaky = (await reserve(B, 'channel', text, 'sneaky.bin', 100)).rows[0];
+await db.exec(`insert into storage.objects (bucket_id, name, metadata) values ('attachments', '${sneaky.path}', '{"size": 9000}')`);
+await expectErr('message cannot attach object larger than its reservation', () => as(B, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: sneaky.path, name: 's.bin', size: 100 }])]));
+// квоты проверяются и для загрузок без резерва (старые клиенты)
+await db.exec('update public.app_limits set user_storage_bytes = 200000');
+await expectErr('legacy upload over personal quota rejected at storage level', () => putObj(B, `channels/${text}/${B}/legacy-big.bin`, 300000));
+await db.exec('update public.app_limits set user_storage_bytes = 157286400, project_storage_bytes = 50000');
+await expectErr('upload over whole-project Storage limit rejected', () => putObj(B, `channels/${text}/${B}/legacy-2.bin`, 60000));
+await expectErr('reserve over whole-project Storage limit rejected', () => reserve(B, 'channel', text, 'p.bin', 60000));
+await db.exec('update public.app_limits set project_storage_bytes = 943718400');
+await expectErr('legacy upload over 50 MB rejected', () => putObj(B, `channels/${text}/${B}/legacy-huge.bin`, 50 * 1024 * 1024 + 1));
+// лимит незавершённых загрузок
+// у A уже есть один незавершённый резерв (a.bin), лимит 3 — ещё два, третий отклоняется
+await db.exec('update public.app_limits set max_pending_uploads = 3');
+await reserve(A, 'channel', text, 'p1.bin', 10);
+await reserve(A, 'channel', text, 'p2.bin', 10);
+await expectErr('too many pending reservations rejected', () => reserve(A, 'channel', text, 'p3.bin', 10));
+await db.exec('update public.app_limits set max_pending_uploads = 5');
+// чужие файлы
+await expectErr('C cannot upload into channel folder of A', () => putObj(C, `channels/${text}/${A}/x.bin`, 10));
+await expectErr('B cannot use reservation path of A', () => putObj(B, r1.path, 10));
+await expectErr('B cannot attach file from A folder', () => as(B, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: r1.path, name: 'x', size: 1000 }])]));
+eq('C sees no attachment objects at all', (await as(C, `select count(*)::int n from storage.objects where bucket_id='attachments'`)).rows[0].n, 0);
+await expectErr('C cannot reserve in DM of others', () => reserve(C, 'dm', dm, 'x.bin', 10));
+await expectErr('C cannot get download grant for DM file', () => as(C, 'select public.request_attachment_download($1)', [`dms/${dm}/${A}/f.bin`]));
+await expectErr('client cannot write download log directly', () => as(C, `insert into public.attachment_downloads (user_id, path, bytes) values ($1, 'x', 0)`, [C]));
+// обязательный режим: исключения только для НЕприкреплённых файлов
+await db.exec('update public.app_limits set enforce_download_grants = true, enforce_reservations = true');
+eq('author cannot sign own ATTACHED file without grant (counted download)', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [r1.path])).rows[0].n, 0);
+eq('author sees own UNattached file (needed to delete it)', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [orphan])).rows[0].n, 1);
+eq('moderator sees unattached channel file of another user', (await as(A, `select count(*)::int n from storage.objects where name=$1`, [small.path])).rows[0].n, 1);
+eq('regular member does not see unattached file of another user', (await as(G, `select count(*)::int n from storage.objects where name=$1`, [small.path])).rows[0].n, 0);
+await expectErr('enforced: old-client upload without reservation rejected', () => putObj(G, `channels/${text}/${G}/old-client.bin`, 10));
+const gr = (await reserve(G, 'channel', text, 'new-client.bin', 10)).rows[0];
+await expectOk('enforced: new-client upload with reservation allowed', () => putObj(G, gr.path, 10));
+await expectErr('enforced: consumed reservation cannot be reused for a second upload', async () => {
+  await as(G, `insert into public.messages (channel_id, content, attachments) values ($1, '', $2)`, [text, JSON.stringify([{ path: gr.path, name: 'n.bin', size: 10 }])]);
+  await db.exec(`delete from storage.objects where name='${gr.path}'`);
+  await putObj(G, gr.path, 10);
+});
+await db.exec('update public.app_limits set enforce_download_grants = false, enforce_reservations = false');
+// бакет: любые типы файлов
+eq('attachments bucket allows all MIME types', (await db.query(`select allowed_mime_types from storage.buckets where id='attachments'`)).rows[0].allowed_mime_types, null);
+
 const usage = (await as(A, 'select public.attachment_usage() u')).rows[0].u;
 eq('usage reports quotas', usage.max_file === 50 * 1024 * 1024 && usage.user_used >= 3000 && usage.user_limit === 157286400, true);
 await expectErr('anon cannot read usage', () => as(null, 'select public.attachment_usage()'));

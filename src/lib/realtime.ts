@@ -17,6 +17,7 @@ import { useCalls } from '@/stores/calls';
 import { sounds } from './sounds';
 import { cleanupStaleUploads } from './media';
 import { onBeforeSignOut } from '@/stores/auth';
+import { useConnectivity } from '@/stores/connectivity';
 
 let channel: RealtimeChannel | null = null;
 
@@ -160,15 +161,33 @@ export function startRealtime() {
     })
     .subscribe((status) => {
       if (gen !== channelGen) return;
-      // После восстановления соединения догружаем то, что могли пропустить
       if (status === 'SUBSCRIBED') {
         restartAttempt = 0;
-        void useUnread.getState().load();
+        useConnectivity.getState().setDataJoined(true);
+        // Повторная подписка после обрыва: события, пришедшие в это время, потеряны — догружаем
+        if (everSubscribed) void resyncAfterReconnect();
+        else void useUnread.getState().load();
+        everSubscribed = true;
         return;
       }
+      useConnectivity.getState().setDataJoined(false);
       // Канал закрыт сервером (истёк токен, сон, обрыв) — realtime-js сам его не вернёт: пересоздаём
       scheduleRestart();
     });
+}
+
+let everSubscribed = false;
+
+/** После восстановления Realtime: непрочитанные, открытые переписки, серверы, друзья, статусы */
+async function resyncAfterReconnect() {
+  if (import.meta.env.DEV) console.debug('[realtime] resync after reconnect');
+  await Promise.allSettled([
+    useUnread.getState().load(),
+    useMessages.getState().refreshLoaded(),
+    useServers.getState().loadAll(),
+    useSocial.getState().load(),
+  ]);
+  usePresence.getState().verify();
 }
 
 let channelGen = 0;
@@ -190,6 +209,8 @@ function scheduleRestart() {
 
 export function stopRealtime() {
   channelGen++;
+  everSubscribed = false;
+  useConnectivity.getState().setDataJoined(false);
   if (restartTimer) clearTimeout(restartTimer);
   restartTimer = null;
   if (channel) void supabase.removeChannel(channel);

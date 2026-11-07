@@ -28,6 +28,8 @@ interface MessagesState {
   extra: Record<string, Message>; // сообщения, на которые отвечают, но которые не загружены
   load: (scope: Scope) => Promise<void>;
   loadOlder: (scope: Scope) => Promise<void>;
+  /** После обрыва Realtime: перечитать последние сообщения всех открытых переписок */
+  refreshLoaded: () => Promise<void>;
   send: (scope: Scope, content: string, items: OutgoingItem[], replyTo: string | null, kind?: 'default' | 'call') => Promise<void>;
   retry: (scope: Scope, messageId: string) => Promise<void>;
   discard: (scope: Scope, messageId: string) => void;
@@ -302,6 +304,27 @@ export const useMessages = create<MessagesState>((set, get) => {
         hasMore: rows.length === PAGE,
         loading: false,
       });
+    },
+
+    refreshLoaded: async () => {
+      const ids = Object.entries(get().byScope)
+        .filter(([, s]) => s.loaded)
+        .map(([id]) => id)
+        .filter((id) => /^[0-9a-f-]{36}$/i.test(id));
+      await Promise.allSettled(
+        ids.map(async (id) => {
+          const { data, error } = await supabase
+            .from('messages')
+            .select('*')
+            .or(`channel_id.eq.${id},dm_id.eq.${id}`)
+            .order('created_at', { ascending: false })
+            .limit(PAGE);
+          if (error || !data) return;
+          const rows = (data as Message[]).map(normalize).reverse();
+          useProfiles.getState().ensure(rows.map((m) => m.author_id));
+          patchScope(id, { messages: mergeSorted(get().byScope[id]?.messages ?? [], rows) });
+        }),
+      );
     },
 
     send: async (scope, content, items, replyTo, kind = 'default') => {

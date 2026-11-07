@@ -85,6 +85,18 @@ class FakeChannel implements RtChannel {
     this.lastState = state;
     this.syncCb?.();
   }
+  /** Короткий сбой сокета: phoenix сам переподключает тот же канал (ERROR → SUBSCRIBED), присутствие на сервере теряется */
+  blip() {
+    this.tracked = null;
+    this.client.server.leave(this);
+    this.status = 'joining';
+    this.statusCb?.('CHANNEL_ERROR', new Error('socket closed'));
+    queueMicrotask(() => {
+      this.status = 'joined';
+      this.client.server.join(this);
+      this.statusCb?.('SUBSCRIBED');
+    });
+  }
   /** Сервер закрыл канал (истёк токен, обрыв): клиент получает CLOSED, канал удалён из сокета */
   serverClose() {
     this.status = 'closed';
@@ -230,6 +242,32 @@ describe('синхронизация состава голосового кан�
     supervisors[0].setPayload({ user_id: IDS[0], channel_id: CH, joined_at: 9, at: 9 });
     await flush();
     expect(views[2]).toEqual([IDS[1], IDS[2], IDS[0]]);
+  });
+
+  it('короткий сбой сокета: канал переподключился сам — индикатор «подключено» возвращается, присутствие восстановлено', async () => {
+    const server = new FakeServer();
+    const client = new FakeClient(server, IDS[0]);
+    const joined: boolean[] = [];
+    let view: string[] = [];
+    const s = new SupervisedChannel({
+      client, topic: TOPIC, key: IDS[0], session: 's',
+      onSync: (st) => (view = reduceVoicePresence(st as Record<string, VoicePresenceMeta[]>).map((m) => m.user_id)),
+      onJoinedChange: (j) => joined.push(j),
+    });
+    s.setPayload({ user_id: IDS[0], channel_id: CH, joined_at: 1, at: 1 });
+    s.start();
+    await flush();
+    expect(joined).toEqual([true]);
+    client.channels.get(TOPIC)!.blip();
+    await flush();
+    // Раньше индикатор оставался «Нет соединения» навсегда; теперь false → true, а присутствие снова на сервере
+    expect(joined).toEqual([true, false, true]);
+    expect(s.isJoined).toBe(true);
+    expect(view).toEqual([IDS[0]]);
+    expect(Object.keys(server.state(TOPIC))).toEqual([IDS[0]]);
+    // Отложенное пересоздание после сбоя не плодит лишних каналов
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(client.channels.size).toBe(1);
   });
 
   it('остановка (выход из аккаунта) снимает присутствие', async () => {

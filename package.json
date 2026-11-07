@@ -1,7 +1,7 @@
 {
   "name": "realism-voice",
   "productName": "Realism Voice",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Realism Voice — голосовой и текстовый мессенджер для Windows",
   "author": "Realism Voice",
   "license": "UNLICENSED",
@@ -16,7 +16,7 @@
     "start": "electron .",
     "icons": "node scripts/generate-icons.mjs",
     "sql:bundle": "node scripts/bundle-sql.mjs",
-    "test:sql": "node scripts/test-sql.mjs",
+    "test:sql": "node scripts/test-sql.mjs && node scripts/test-sql-upgrade.mjs",
     "dist": "npm run build && electron-builder --win nsis --x64 --publish never",
     "pack": "npm run build && electron-builder --win dir --x64 --publish never",
     "test:updater": "node scripts/test-updater.cjs",

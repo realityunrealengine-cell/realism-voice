@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useState } from 'react';
-import { signedUrl } from '@/lib/media';
+import { SIGNED_URL_TTL, signedUrl } from '@/lib/media';
 import { formatSize, plural } from '@/lib/format';
 import type { Attachment } from '@/lib/types';
 import { toast, useUi } from '@/stores/ui';
@@ -15,13 +15,13 @@ import { fileExtension, isDangerousFile } from '../../../electron/fileRisk';
 /** Изображения больше этого размера не загружаются для превью автоматически (бережём трафик бесплатного тарифа) */
 const AUTO_PREVIEW_MAX = 5 * 1024 * 1024;
 
-function useSigned(path: string, enabled: boolean) {
+function useSigned(path: string, enabled: boolean, ttl: number = SIGNED_URL_TTL.preview) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   useEffect(() => {
     if (!path || !enabled) return;
     let alive = true;
-    signedUrl(path)
+    signedUrl(path, { ttl })
       .then((u) => {
         if (!alive) return;
         if (u) setUrl(u);
@@ -31,7 +31,7 @@ function useSigned(path: string, enabled: boolean) {
     return () => {
       alive = false;
     };
-  }, [path, enabled]);
+  }, [path, enabled, ttl]);
   return { url, failed };
 }
 
@@ -282,7 +282,7 @@ const PLAYABLE_VIDEO = ['video/mp4', 'video/webm', 'video/ogg'];
 
 function VideoAttachment({ a }: { a: Attachment }) {
   const [requested, setRequested] = useState(false);
-  const { url, failed } = useSigned(a.path, requested);
+  const { url, failed } = useSigned(a.path, requested, SIGNED_URL_TTL.video);
   if (!PLAYABLE_VIDEO.includes(a.mime)) return <FileCard a={a} />;
   if (!requested || !url) {
     return (
