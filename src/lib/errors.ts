@@ -6,7 +6,10 @@ const AUTH_MESSAGES: Record<string, string> = {
   user_already_exists: 'Пользователь с таким email уже зарегистрирован',
   email_exists: 'Пользователь с таким email уже зарегистрирован',
   weak_password: 'Слишком простой пароль (минимум 8 символов)',
-  over_email_send_rate_limit: 'Слишком много писем. Подождите немного и попробуйте снова.',
+  // Лимит почтового сервиса Supabase на весь проект, а не ошибка пользователя
+  over_email_send_rate_limit:
+    'Сервер сейчас не может отправить письмо подтверждения: исчерпан лимит писем. Аккаунт не создан — попробуйте ещё раз примерно через час.',
+  email_address_not_authorized: 'Сервер пока не может отправлять письма на этот адрес. Сообщите администратору Realism Voice.',
   over_request_rate_limit: 'Слишком много попыток. Подождите немного.',
   otp_expired: 'Код или ссылка устарели. Запросите новые.',
   same_password: 'Новый пароль должен отличаться от текущего',
@@ -35,12 +38,36 @@ export function errorMessage(err: unknown, fallback = 'Произошла оши
   if (/Email not confirmed/i.test(msg)) return AUTH_MESSAGES.email_not_confirmed;
   if (/User already registered/i.test(msg)) return AUTH_MESSAGES.user_already_exists;
   if (/Password should be/i.test(msg)) return AUTH_MESSAGES.weak_password;
+  if (/email rate limit/i.test(msg)) return AUTH_MESSAGES.over_email_send_rate_limit;
   if (/rate limit/i.test(msg)) return AUTH_MESSAGES.over_request_rate_limit;
   if (/Payload too large|exceeded the maximum allowed size/i.test(msg)) return 'Файл слишком большой';
   if (/mime type/i.test(msg)) return 'Недопустимый тип файла';
   // Ошибки из наших SQL-функций уже на русском
   if (/[а-яё]/i.test(msg)) return msg;
   return msg || fallback;
+}
+
+/** Ошибка с русским текстом и исходным кодом Supabase (чтобы интерфейс мог отреагировать на код) */
+export class AppError extends Error {
+  constructor(message: string, public code: string | null) {
+    super(message);
+    this.name = 'AppError';
+  }
+}
+
+export function errorCode(err: unknown): string | null {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  if (!e) return null;
+  if (typeof e.code === 'string' && e.code) return e.code;
+  const msg = typeof e.message === 'string' ? e.message : '';
+  if (/Email not confirmed/i.test(msg)) return 'email_not_confirmed';
+  if (/email rate limit/i.test(msg)) return 'over_email_send_rate_limit';
+  return null;
+}
+
+/** Перевести ошибку Supabase, сохранив её код */
+export function toAppError(err: unknown, fallback?: string): AppError {
+  return new AppError(errorMessage(err, fallback), errorCode(err));
 }
 
 /** Для supabase.functions.invoke: достаёт тело ответа с сообщением */

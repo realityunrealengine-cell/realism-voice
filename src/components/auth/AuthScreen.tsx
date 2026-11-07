@@ -3,6 +3,7 @@ import { ArrowLeft, AtSign, Eye, EyeOff, KeyRound, Lock, Mail, MailCheck, Shield
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { useAuth } from '@/stores/auth';
 import { GOOGLE_AUTH_ENABLED, supabase } from '@/lib/supabase';
+import { AppError } from '@/lib/errors';
 import { Spinner } from '@/components/ui/primitives';
 import { Wordmark } from '@/components/ui/Logo';
 
@@ -103,7 +104,19 @@ export function AuthScreen() {
     e.preventDefault();
     const auth = useAuth.getState();
     if (mode === 'login') {
-      void run(() => auth.signIn(email, password));
+      void run(async () => {
+        try {
+          await auth.signIn(email, password);
+        } catch (err) {
+          // Аккаунт создан, но email не подтверждён — сразу показываем подтверждение и повторную отправку письма
+          if (err instanceof AppError && err.code === 'email_not_confirmed') {
+            go('confirm');
+            setNotice('Email ещё не подтверждён. Введите код из письма или нажмите «Отправить письмо ещё раз».');
+            return;
+          }
+          throw err;
+        }
+      });
     } else if (mode === 'register') {
       if (!USERNAME_RE.test(username)) return setError('Username: 3–32 символа, латиница в нижнем регистре, цифры, «_» и «.»');
       if (displayName.trim().length < 1) return setError('Укажите отображаемое имя');

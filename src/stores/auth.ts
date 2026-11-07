@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { Session } from '@supabase/supabase-js';
 import { AUTH_CALLBACK_URL, AUTH_RESET_URL, supabase } from '@/lib/supabase';
-import { errorMessage } from '@/lib/errors';
+import { errorMessage, toAppError } from '@/lib/errors';
 import type { Profile } from '@/lib/types';
 import type { DeepLink } from '../../electron/shared';
 import { useProfiles } from './profiles';
@@ -95,7 +95,7 @@ export const useAuth = create<AuthState>((set, get) => ({
 
   signIn: async (email, password) => {
     const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
-    if (error) throw new Error(errorMessage(error));
+    if (error) throw toAppError(error);
   },
 
   signUp: async (email, password, username, displayName) => {
@@ -110,7 +110,7 @@ export const useAuth = create<AuthState>((set, get) => ({
         data: { username: username.toLowerCase(), display_name: displayName.trim() },
       },
     });
-    if (error) throw new Error(errorMessage(error));
+    if (error) throw toAppError(error);
     // Если в проекте включено подтверждение email, сессии ещё нет
     if (!data.session) {
       // Supabase не раскрывает, существует ли уже такой email: identities будет пустым
@@ -134,7 +134,7 @@ export const useAuth = create<AuthState>((set, get) => ({
       email: email.trim(),
       options: { emailRedirectTo: AUTH_CALLBACK_URL },
     });
-    if (error) throw new Error(errorMessage(error));
+    if (error) throw toAppError(error);
   },
 
   sendReset: async (email) => {
