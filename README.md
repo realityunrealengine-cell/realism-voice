@@ -7,6 +7,18 @@ Supabase (Auth, PostgreSQL + RLS, Realtime, Storage, Edge Functions) · LiveKit 
 
 Всё работает через облако: ваш компьютер не нужно держать включённым, друзья подключаются из любой страны.
 
+## ⬇️ Скачать
+
+**[Последняя версия Realism Voice для Windows →](https://github.com/realityunrealengine-cell/realism-voice-releases/releases/latest)**
+
+На странице релиза откройте раздел **Assets** и нажмите **`RealismVoice-Setup.exe`**. Дальше приложение обновляется само.
+При первом запуске Windows SmartScreen может предупредить о неподписанном установщике: «Подробнее» → «Выполнить в любом случае».
+
+## Лицензия
+
+Исходный код открыт **только для ознакомления** — все права защищены, подробности в файле [LICENSE](LICENSE).
+Копировать код, выпускать свои сборки и модификации без разрешения автора нельзя.
+
 ---
 
 ## 1. Быстрый старт (разработка)
@@ -145,9 +157,9 @@ Workflow `.github/workflows/build-windows.yml` собирает установщ
 
 ### Настройка (один раз)
 
-Исходники: закрытый репозиторий `realityunrealengine-cell/realism-voice` (`origin`).
+Исходники: публичный (только для просмотра) репозиторий `realityunrealengine-cell/realism-voice` (`origin`).
 Обновления: публичный `realityunrealengine-cell/realism-voice-releases`, только установщики и `latest.yml`; приложение читает их без токена.
-Исходный код в публичный репозиторий не отправляется.
+Секреты (токен релизов, ключ подписи обновлений, ключи LiveKit) хранятся только в GitHub Secrets и Supabase — в репозитории их нет.
 
 1. Включите двухфакторную защиту GitHub.
 2. Создайте Fine-grained token (**Settings → Developer settings → Personal access tokens**): доступ только к
