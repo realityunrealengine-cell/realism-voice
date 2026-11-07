@@ -5,7 +5,7 @@ import { configError } from '@/lib/supabase';
 import { bootstrap, teardown } from '@/lib/realtime';
 import { useAuth } from '@/stores/auth';
 import { ACCENTS, useSettings } from '@/stores/settings';
-import { useUi } from '@/stores/ui';
+import { registerNetworkHelp, useUi } from '@/stores/ui';
 import { useConnectivity } from '@/stores/connectivity';
 import { subscribeTransferEvents } from '@/stores/transfers';
 import type { DeepLink } from '../electron/shared';
@@ -17,6 +17,7 @@ import { LogoMark } from '@/components/ui/Logo';
 import { ContextMenu, Toasts } from '@/components/ui/Overlays';
 import { UpdateNotice } from '@/components/ui/UpdateNotice';
 import { UpdatesModal } from '@/components/settings/UpdatesSection';
+import { NetDiagnostics } from '@/components/ui/NetDiagnostics';
 
 let pendingInvite: string | null = null;
 
@@ -94,6 +95,7 @@ export default function App() {
     void window.rv?.app.consumeDeepLink().then((l) => l && handleDeepLink(l));
     const offNet = useConnectivity.getState().init();
     subscribeTransferEvents();
+    registerNetworkHelp(() => useConnectivity.getState().openDiagnostics());
     return () => {
       off?.();
       offNet();
@@ -145,6 +147,7 @@ export default function App() {
       </AnimatePresence>
       <ContextMenu />
       <UpdatesModal />
+      <NetDiagnostics />
       <UpdateNotice />
       <Toasts />
     </div>

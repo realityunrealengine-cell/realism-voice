@@ -4,6 +4,8 @@ import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { useAuth } from '@/stores/auth';
 import { GOOGLE_AUTH_ENABLED, supabase } from '@/lib/supabase';
 import { AppError } from '@/lib/errors';
+import { NETWORK_ERROR_RE } from '@/stores/ui';
+import { useConnectivity } from '@/stores/connectivity';
 import { Spinner } from '@/components/ui/primitives';
 import { Wordmark } from '@/components/ui/Logo';
 
@@ -285,6 +287,11 @@ export function AuthScreen() {
               {error && (
                 <motion.div initial={{ opacity: 0, y: -4 }} animate={{ opacity: 1, y: 0 }} className="rounded-xl border border-rose-400/20 bg-rose-500/10 px-3.5 py-2.5 text-sm text-rose-200">
                   {error}
+                  {NETWORK_ERROR_RE.test(error) && (
+                    <button type="button" className="mt-1.5 block text-xs font-semibold text-sky-300 hover:underline" onClick={() => useConnectivity.getState().openDiagnostics()}>
+                      Диагностика подключения →
+                    </button>
+                  )}
                 </motion.div>
               )}
 

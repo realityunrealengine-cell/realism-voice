@@ -22,6 +22,7 @@ import * as secureStore from './secureStore';
 import { globalPttAvailable, initPtt, setPttBinding, stopHook } from './ptt';
 import { checkForUpdates, getUpdateState, initUpdater, installUpdate, setInCall, startDownload } from './updater';
 import { setupTransfers } from './transfers';
+import { setupNetDiagnostics } from './netDiagnostics';
 
 // Тестовая сборка обновлений ставится рядом с рабочей и не должна перехватывать её ссылки realismvoice://
 const IS_UPDATE_TEST_BUILD = app.getName() === 'Realism Voice Update Test';
@@ -498,6 +499,7 @@ function setupIpc() {
   });
 
   setupTransfers(() => mainWindow, assertSender);
+  setupNetDiagnostics(assertSender);
 }
 
 // Сон и пробуждение Windows: интерфейс восстанавливает присутствие и голосовую связь

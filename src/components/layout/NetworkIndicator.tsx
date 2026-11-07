@@ -10,9 +10,13 @@ export function NetworkIndicator() {
   if (!signedIn) return null;
   if (sync.state === 'offline') {
     return (
-      <span className="ml-3 flex items-center gap-1.5 rounded-full bg-rose-500/15 px-2 py-0.5 text-[11px] text-rose-300" title={sync.detail ?? ''}>
+      <button
+        className="no-drag ml-3 flex items-center gap-1.5 rounded-full bg-rose-500/15 px-2 py-0.5 text-[11px] text-rose-300 hover:bg-rose-500/25"
+        title={sync.detail ?? ''}
+        onClick={() => useConnectivity.getState().openDiagnostics()}
+      >
         <WifiOff className="h-3 w-3" /> Нет интернета
-      </span>
+      </button>
     );
   }
   if (sync.state === 'syncing' || resuming) {
@@ -20,7 +24,7 @@ export function NetworkIndicator() {
       <button
         className="no-drag ml-3 flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300 hover:bg-amber-500/25"
         title={sync.detail ?? 'Восстановление после сна…'}
-        onClick={() => void useConnectivity.getState().recover('manual')}
+        onClick={() => useConnectivity.getState().openDiagnostics()}
       >
         <RefreshCw className="h-3 w-3 animate-spin [animation-duration:2s]" /> Синхронизация с сервером…
       </button>

@@ -16,6 +16,10 @@ interface ConnectivityState {
   /** Канал изменений базы (сообщения, серверы, друзья) подписан */
   dataJoined: boolean;
   setDataJoined: (joined: boolean) => void;
+  /** Окно диагностики подключения */
+  diagnosticsOpen: boolean;
+  openDiagnostics: () => void;
+  closeDiagnostics: () => void;
   init: () => () => void;
   recover: (reason: string) => Promise<void>;
 }
@@ -28,6 +32,9 @@ export const useConnectivity = create<ConnectivityState>((set, get) => ({
   resuming: false,
   socketOk: true,
   dataJoined: false,
+  diagnosticsOpen: false,
+  openDiagnostics: () => set({ diagnosticsOpen: true }),
+  closeDiagnostics: () => set({ diagnosticsOpen: false }),
 
   setDataJoined: (joined) => {
     if (get().dataJoined !== joined) set({ dataJoined: joined });

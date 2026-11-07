@@ -2,7 +2,7 @@
 // Наружу отдаётся только узкий типизированный API — без прямого доступа к ipcRenderer.
 import { contextBridge, ipcRenderer, IpcRendererEvent, webUtils } from 'electron';
 import type {
-  AppSettings, DeepLink, DownloadProgress, PickedItem, PowerEvent, RvBridge, ScreenSource, TransferProgress, UpdateState,
+  AppSettings, DeepLink, DownloadProgress, NetReport, PickedItem, PowerEvent, RvBridge, ScreenSource, TransferProgress, UpdateState,
 } from './shared';
 
 function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
@@ -33,6 +33,7 @@ const bridge: RvBridge = {
     onDeepLink: (cb) => subscribe<DeepLink>('deeplink', cb),
     onHotkey: (cb) => subscribe<'toggleMute' | 'toggleDeafen'>('hotkey', cb),
     onPower: (cb) => subscribe<PowerEvent>('power', cb),
+    diagnoseNetwork: (serverUrl, apiKey) => ipcRenderer.invoke('net:diagnose', serverUrl, apiKey) as Promise<NetReport>,
     quit: () => ipcRenderer.send('app:quit'),
   },
   screen: {

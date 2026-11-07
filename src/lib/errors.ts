@@ -26,7 +26,7 @@ export function errorMessage(err: unknown, fallback = 'Произошла оши
   const e = err as { code?: string; message?: string; status?: number; name?: string };
   if (e.code && AUTH_MESSAGES[e.code]) return AUTH_MESSAGES[e.code];
   const msg = e.message ?? '';
-  if (/Failed to fetch|NetworkError|network/i.test(msg)) return 'Нет соединения с сервером. Проверьте интернет.';
+  if (/Failed to fetch|NetworkError|network/i.test(msg)) return 'Нет соединения с сервером. Проверьте интернет или запустите диагностику подключения.';
   if (e.code === 'PGRST205' || e.code === '42P01' || /schema cache|does not exist/i.test(msg))
     return 'База данных не настроена: примените SQL-миграции Realism Voice в Supabase.';
   if (e.code === 'PGRST202' || /Could not find the function/i.test(msg))

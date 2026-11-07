@@ -1,6 +1,6 @@
 import { Headphones, HeadphoneOff, Mic, MicOff, Monitor, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff } from 'lucide-react';
 import { TONE_TEXT, VOICE_STATUS_UI } from '@/components/voice/voiceStatusUi';
-import { useSyncView } from '@/stores/connectivity';
+import { useConnectivity, useSyncView } from '@/stores/connectivity';
 import { ConnectionQuality } from 'livekit-client';
 import { useAuth } from '@/stores/auth';
 import { useVoice } from '@/stores/voice';
@@ -129,6 +129,11 @@ export function UserPanel() {
             <div
               className={`truncate text-xs ${sync.state === 'offline' ? 'text-rose-300' : sync.state === 'syncing' ? 'text-amber-300' : 'text-slate-400'}`}
               title={sync.detail ?? undefined}
+              onClick={(e) => {
+                if (sync.state === 'ok') return;
+                e.stopPropagation();
+                useConnectivity.getState().openDiagnostics();
+              }}
             >
               {sync.label ?? (profile.custom_status || `@${profile.username}`)}
             </div>

@@ -116,8 +116,18 @@ export const useUi = create<UiState>((set, get) => ({
   setEditing: (editing) => set({ editing }),
 }));
 
+/** Текст сетевой ошибки (см. lib/errors.ts) — у таких уведомлений появляется кнопка «Диагностика» */
+export const NETWORK_ERROR_RE = /Нет соединения с сервером/;
+let networkHelp: (() => void) | null = null;
+export function registerNetworkHelp(fn: () => void) {
+  networkHelp = fn;
+}
+
 export const toast = {
   info: (title: string, body?: string) => useUi.getState().toast({ kind: 'info', title, body }),
   success: (title: string, body?: string) => useUi.getState().toast({ kind: 'success', title, body }),
-  error: (title: string, body?: string) => useUi.getState().toast({ kind: 'error', title, body }),
+  error: (title: string, body?: string) => {
+    const help = networkHelp && NETWORK_ERROR_RE.test(`${title} ${body ?? ''}`) ? networkHelp : null;
+    useUi.getState().toast(help ? { kind: 'error', title, body, action: { label: 'Диагностика', onClick: help }, timeout: 12000 } : { kind: 'error', title, body });
+  },
 };

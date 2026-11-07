@@ -57,6 +57,27 @@ export interface UpdateState {
 
 export type PowerEvent = 'suspend' | 'resume' | 'lock-screen' | 'unlock-screen';
 
+// ---------- Диагностика подключения ----------
+
+export interface NetCheck {
+  id: string;
+  label: string;
+  ok: boolean;
+  ms: number;
+  detail: string | null;
+}
+
+export interface NetReport {
+  at: string;
+  appVersion: string;
+  platform: string;
+  host: string;
+  proxy: string | null;
+  verdict: import('./netVerdict').NetVerdict;
+  facts: import('./netVerdict').NetFacts;
+  checks: NetCheck[];
+}
+
 // ---------- Передача файлов ----------
 
 /** Файл или папка, выбранные пользователем; путь на диске остаётся в main-процессе */
@@ -168,6 +189,8 @@ export interface RvBridge {
     onHotkey(cb: (action: 'toggleMute' | 'toggleDeafen') => void): () => void;
     /** Сон/пробуждение Windows и блокировка экрана */
     onPower(cb: (event: PowerEvent) => void): () => void;
+    /** Пошаговая проверка пути до сервера (интернет, DNS, TLS, прокси, WebSocket, часы) */
+    diagnoseNetwork(serverUrl: string, apiKey: string): Promise<NetReport>;
     quit(): void;
   };
   files: FilesBridge;
