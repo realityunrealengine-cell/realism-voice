@@ -48,7 +48,7 @@ jobs:
         run: npm test
 
       # Публичные параметры клиента задаются в Settings → Secrets and variables → Actions → Variables.
-      # Секреты LiveKit и Supabase сюда НЕ передаются.
+      # Ключи Cloudflare Realtime SFU и секреты Supabase сюда НЕ передаются.
       - name: Build application
         run: |
           npm run build:electron

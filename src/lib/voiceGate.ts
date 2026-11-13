@@ -1,6 +1,12 @@
-// Аудио-процессор для LiveKit: громкость микрофона + шлюз Voice Activity Detection / Push-to-Talk.
+// Обработка микрофона перед отправкой: громкость + шлюз Voice Activity Detection / Push-to-Talk.
 // Звук не передаётся, пока шлюз закрыт (тишина ниже порога или клавиша PTT не нажата).
-import type { AudioProcessorOptions, Track, TrackProcessor } from 'livekit-client';
+// На выходе — один постоянный трек (processedTrack): при смене микрофона меняется только вход,
+// отправляемый в Cloudflare Realtime трек остаётся тем же.
+
+export interface AudioProcessorOptions {
+  track: MediaStreamTrack;
+  audioContext: AudioContext;
+}
 
 export interface GateConfig {
   mode: 'vad' | 'ptt';
@@ -9,7 +15,7 @@ export interface GateConfig {
   pttReleaseMs: number;
 }
 
-export class VoiceGate implements TrackProcessor<Track.Kind.Audio, AudioProcessorOptions> {
+export class VoiceGate {
   name = 'rv-voice-gate';
   processedTrack?: MediaStreamTrack;
 
@@ -45,6 +51,9 @@ export class VoiceGate implements TrackProcessor<Track.Kind.Audio, AudioProcesso
 
   async destroy(): Promise<void> {
     this.teardown();
+    this.processedTrack?.stop();
+    this.processedTrack = undefined;
+    this.dest = null;
   }
 
   setConfig(patch: Partial<GateConfig>) {
@@ -72,7 +81,8 @@ export class VoiceGate implements TrackProcessor<Track.Kind.Audio, AudioProcesso
     this.analyser = this.analyserNode;
     this.gateNode = ctx.createGain();
     this.gateNode.gain.value = 0;
-    this.dest = ctx.createMediaStreamDestination();
+    // Выход сохраняется между перезапусками: отправляемый трек не меняется при смене микрофона
+    this.dest ??= ctx.createMediaStreamDestination();
     this.source.connect(this.gainNode);
     this.gainNode.connect(this.analyserNode);
     this.gainNode.connect(this.gateNode);
@@ -117,7 +127,6 @@ export class VoiceGate implements TrackProcessor<Track.Kind.Audio, AudioProcesso
     }
     this.source = this.gainNode = this.gateNode = this.analyserNode = null;
     this.analyser = null;
-    this.dest = null;
     this.open = false;
   }
 }

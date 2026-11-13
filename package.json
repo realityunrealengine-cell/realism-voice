@@ -1,7 +1,7 @@
 {
   "name": "realism-voice",
   "productName": "Realism Voice",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "description": "Realism Voice — голосовой и текстовый мессенджер для Windows",
   "author": "Realism Voice",
   "license": "UNLICENSED",
@@ -12,7 +12,7 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:renderer": "vite build",
     "build": "npm run typecheck && npm run build:electron && npm run build:renderer",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.electron.json --noEmit && tsc -p supabase/functions/tsconfig.json",
     "start": "electron .",
     "icons": "node scripts/generate-icons.mjs",
     "sql:bundle": "node scripts/bundle-sql.mjs",
@@ -24,7 +24,8 @@
     "update-key:generate": "node scripts/generate-update-key.mjs",
     "update-test:build": "node scripts/update-test.mjs build",
     "update-test:serve": "node scripts/update-test.mjs serve",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:sfu-live": "electron scripts/sfu-smoke/main.cjs"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.15",
@@ -40,7 +41,6 @@
     "electron": "^37.10.3",
     "electron-builder": "^26.18.0",
     "framer-motion": "^11.18.2",
-    "livekit-client": "^2.23.0",
     "lucide-react": "^1.67.0",
     "png-to-ico": "^3.0.2",
     "postcss": "^8.5.32",

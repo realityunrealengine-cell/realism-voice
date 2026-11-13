@@ -76,15 +76,15 @@ export async function functionErrorMessage(err: unknown): Promise<string> {
   if (ctx && typeof ctx.json === 'function') {
     try {
       const body = await ctx.clone().json();
-      if (body?.error === 'livekit_not_configured')
-        return 'Голосовой сервер LiveKit не настроен. Администратору нужно задать секреты LIVEKIT_URL, LIVEKIT_API_KEY и LIVEKIT_API_SECRET в Supabase.';
+      if (body?.error === 'voice_not_configured')
+        return 'Голосовой сервер Cloudflare Realtime не настроен. Администратору нужно задать секреты CF_SFU_APP_ID и CF_SFU_APP_TOKEN для Edge Functions в Supabase.';
       if (body?.message) return String(body.message);
     } catch {
       /* ignore */
     }
-    if (ctx.status === 404) return 'Edge Function livekit-token не развёрнута в Supabase.';
+    if (ctx.status === 404) return 'Edge Function voice-sfu не развёрнута в Supabase.';
   }
   const name = (err as { name?: string })?.name;
-  if (name === 'FunctionsFetchError') return 'Не удалось связаться с Edge Function livekit-token (она развёрнута?).';
+  if (name === 'FunctionsFetchError') return 'Не удалось связаться с Edge Function voice-sfu (она развёрнута?).';
   return errorMessage(err);
 }

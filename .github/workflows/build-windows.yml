@@ -43,7 +43,7 @@ jobs:
         run: npm test
 
       # Публичные параметры клиента задаются в Settings → Secrets and variables → Actions → Variables.
-      # Секреты LiveKit сюда НЕ передаются — они хранятся только в Supabase Edge Functions.
+      # Ключи Cloudflare Realtime SFU сюда НЕ передаются — они хранятся только в Supabase Edge Functions.
       - name: Build installer
         run: npm run dist
         env:

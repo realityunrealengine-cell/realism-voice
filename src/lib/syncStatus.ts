@@ -1,4 +1,4 @@
-// Состояние связи с сервером Realism Voice (Supabase Realtime) — ОТДЕЛЬНО от голосовой связи (LiveKit).
+// Состояние связи с сервером Realism Voice (Supabase Realtime) — ОТДЕЛЬНО от голосовой связи (Cloudflare Realtime SFU).
 //
 // Ошибка версий 1.0.x: под ником в нижней панели показывалось «Нет соединения…», когда закрывался
 // Realtime-канал статусов (presence:global). Голос при этом работал через LiveKit, а надпись

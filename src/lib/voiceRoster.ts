@@ -1,10 +1,10 @@
 // Состав голосовых каналов: один согласованный источник для счётчика и списка участников.
 //
-// Почему так. Раньше счётчик «N в канале» брался из комнаты LiveKit, а список в левой панели —
+// Почему так. Раньше счётчик «N в канале» брался из голосовой комнаты, а список в левой панели —
 // из Supabase Presence. Если presence-канал клиента «умирал» (сервер закрывал его после истечения
 // токена, сна Windows или быстрого переключения серверов), список переставал обновляться и расходился
 // со счётчиком. Теперь:
-//   * для канала, к которому подключён сам пользователь, состав определяет LiveKit (там реальные
+//   * для канала, к которому подключён сам пользователь, состав определяет комната Cloudflare Realtime SFU (там реальные
 //     медиасоединения), presence лишь дополняет флаги (заглушён, без звука, камера, экран);
 //   * для остальных каналов состав берётся из presence — других данных у клиента нет;
 //   * статус «В сети»/«Невидимый» на состав голосового канала не влияет.
@@ -53,7 +53,7 @@ function num(v: unknown, fallback: number): number {
 /**
  * Свести состояние presence (ключ → список метаданных устройств) к одной записи на пользователя.
  * У пользователя может быть несколько устройств; в голосе одновременно бывает только одно
- * (LiveKit не пускает две сессии с одним identity), поэтому берётся самая свежая запись.
+ * (второе устройство вытесняет первое), поэтому берётся самая свежая запись.
  */
 export function reduceVoicePresence(state: Record<string, VoicePresenceMeta[] | undefined>): VoiceMember[] {
   const byUser = new Map<string, { m: VoiceMember; at: number }>();
@@ -87,7 +87,7 @@ export function sortRoster(list: VoiceMember[]): VoiceMember[] {
 /**
  * Участники конкретного голосового канала.
  * @param presence участники всех голосовых каналов сервера по presence
- * @param live если пользователь сам подключён к ЭТОМУ каналу — участники комнаты LiveKit
+ * @param live если пользователь сам подключён к ЭТОМУ каналу — участники голосовой комнаты
  */
 export function channelRoster(channelId: string, presence: VoiceMember[], live: LiveParticipant[] | null): VoiceMember[] {
   if (!live) return sortRoster(presence.filter((m) => m.channel_id === channelId));
@@ -112,11 +112,11 @@ export function channelRoster(channelId: string, presence: VoiceMember[], live: 
   return sortRoster(out);
 }
 
-/** Все участники голосовых каналов сервера с учётом комнаты LiveKit, к которой подключён пользователь */
+/** Все участники голосовых каналов сервера с учётом голосовой комнаты, к которой подключён пользователь */
 export function serverRoster(presence: VoiceMember[], liveChannelId: string | null, live: LiveParticipant[] | null): VoiceMember[] {
   if (!liveChannelId || !live) return presence;
   const inLive = new Set(live.map((p) => p.identity));
-  // Пользователь из комнаты LiveKit не может одновременно числиться в другом канале этого сервера
+  // Пользователь из голосовой комнаты не может одновременно числиться в другом канале этого сервера
   const others = presence.filter((m) => m.channel_id !== liveChannelId && !inLive.has(m.user_id));
   return sortRoster([...others, ...channelRoster(liveChannelId, presence, live)]);
 }

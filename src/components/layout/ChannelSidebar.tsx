@@ -64,7 +64,7 @@ export function ChannelSidebar({ serverId }: { serverId: string }) {
     return out;
   }, [channels, categories]);
 
-  // Для канала, к которому подключены мы сами, состав берётся из LiveKit (как и счётчик в голосовом окне)
+  // Для канала, к которому подключены мы сами, состав берётся из комнаты Cloudflare Realtime (как и счётчик в голосовом окне)
   const liveChannelId =
     voiceTarget?.kind === 'channel' && voiceTarget.serverId === serverId && voiceStatus === 'connected' ? voiceTarget.channelId : null;
   const live = useMemo(() => (liveChannelId ? liveParticipants(participants) : null), [liveChannelId, participants]);

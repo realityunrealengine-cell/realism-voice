@@ -4,7 +4,6 @@ import {
   AlertTriangle, Expand, Headphones, HeadphoneOff, Mic, MicOff, Monitor, MonitorOff, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff, Volume2,
   MessageSquare, Radio,
 } from 'lucide-react';
-import type { Track } from 'livekit-client';
 import { useVoice, type ParticipantView } from '@/stores/voice';
 import { useUi } from '@/stores/ui';
 import { useSettings } from '@/stores/settings';
@@ -17,14 +16,14 @@ import { QUALITY } from '@/components/layout/UserPanel';
 import { CallTimer } from './CallTimer';
 import { TONE_DOT, TONE_PILL, VOICE_STATUS_UI } from './voiceStatusUi';
 
-function TrackVideo({ track, mirror, contain }: { track: Track; mirror?: boolean; contain?: boolean }) {
+function TrackVideo({ track, mirror, contain }: { track: MediaStreamTrack; mirror?: boolean; contain?: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    track.attach(el);
+    el.srcObject = new MediaStream([track]);
     return () => {
-      track.detach(el);
+      el.srcObject = null;
     };
   }, [track]);
   return <video ref={ref} autoPlay playsInline muted className={`h-full w-full ${contain ? 'object-contain' : 'object-cover'} ${mirror ? 'mirror' : ''}`} />;

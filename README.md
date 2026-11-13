@@ -3,7 +3,7 @@
 Десктопный мессенджер для Windows: серверы, текстовые и голосовые каналы, личные сообщения, друзья, видеозвонки и демонстрация экрана.
 
 **Стек:** Electron 37 · React 18 + TypeScript · Vite 6 · Tailwind CSS · Zustand · Framer Motion · Lucide ·
-Supabase (Auth, PostgreSQL + RLS, Realtime, Storage, Edge Functions) · LiveKit (WebRTC SFU) · electron-builder + NSIS.
+Supabase (Auth, PostgreSQL + RLS, Realtime, Storage, Edge Functions) · Cloudflare Realtime SFU (WebRTC) · electron-builder + NSIS.
 
 Всё работает через облако: ваш компьютер не нужно держать включённым, друзья подключаются из любой страны.
 
@@ -89,41 +89,56 @@ realismvoice://auth/reset
 - **Authentication → Emails → SMTP Settings** — подключите свой SMTP. Встроенная почта Supabase отправляет лишь несколько писем в час и годится только для тестов.
 - (необязательно) В шаблоны писем «Confirm signup» и «Reset password» добавьте `{{ .Token }}` — тогда в письме будет код, который можно ввести прямо в приложении, без перехода по ссылке.
 
-### 2.3. Edge Function `livekit-token`
+### 2.3. Edge Function `voice-sfu`
 
-**Через Dashboard:** Edge Functions → **Deploy a new function** → «Via Editor» → имя `livekit-token` →
-вставьте содержимое `supabase/functions/livekit-token/index.ts` → Deploy.
+**Через Dashboard:** Edge Functions → **Deploy a new function** → «Via Editor» → имя `voice-sfu` →
+вставьте содержимое `supabase/functions/voice-sfu/index.ts` → Deploy.
 Затем в настройках функции **выключите «Verify JWT with legacy secret»** — функция сама проверяет пользователя через `auth.getUser()` (это работает и с новыми ключами подписи JWT).
 
 **Через CLI:**
 ```bash
-npx supabase functions deploy livekit-token --no-verify-jwt --project-ref yqoxdrkxgnputpqsclzx
+npx supabase functions deploy voice-sfu --no-verify-jwt --project-ref yqoxdrkxgnputpqsclzx
 ```
+
+Функция `livekit-token` (голос версий 1.1.x через LiveKit) больше не используется приложением 1.2.0+; её можно оставить для отката.
 
 ---
 
-## 3. Настройка LiveKit (голос, видео, экран)
+## 3. Настройка Cloudflare Realtime SFU (голос, видео, экран)
 
-1. Зарегистрируйтесь на <https://cloud.livekit.io> и создайте проект (бесплатного тарифа достаточно для старта).
-2. **Settings → API Keys → Create key**. Скопируйте:
-   - **URL** вида `wss://ваш-проект.livekit.cloud`
-   - **API Key**
-   - **API Secret** (показывается один раз)
-3. Supabase Dashboard → **Edge Functions → Secrets** (Manage secrets) → добавьте:
+Медиа идут напрямую между приложением и Cloudflare Realtime SFU (WebRTC). Отдельный сервер не нужен:
+Edge Function `voice-sfu` проверяет права и от имени пользователя вызывает API SFU, а состав комнаты
+участники сообщают друг другу через уже существующие приватные каналы Supabase Realtime
+(`typing:<канал>` — право как у просмотра канала, `dm:<переписка>` — только участники). База данных не меняется.
+
+1. Cloudflare Dashboard → **Realtime → Serverless SFU → Create** (приложение, например `realism-voice`).
+   Скопируйте **App ID** и **App Secret (API token)**.
+2. Supabase Dashboard → **Edge Functions → Secrets** (Manage secrets) → добавьте:
    ```
-   LIVEKIT_URL=wss://ваш-проект.livekit.cloud
-   LIVEKIT_API_KEY=APIxxxxxxxx
-   LIVEKIT_API_SECRET=xxxxxxxxxxxxxxxx
+   CF_SFU_APP_ID=<App ID>
+   CF_SFU_APP_TOKEN=<App Secret>
    ```
    или через CLI:
    ```bash
-   npx supabase secrets set LIVEKIT_URL=wss://... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... --project-ref yqoxdrkxgnputpqsclzx
+   npx supabase secrets set CF_SFU_APP_ID=... CF_SFU_APP_TOKEN=... --project-ref yqoxdrkxgnputpqsclzx
    ```
+3. Разверните функцию `voice-sfu` (раздел 2.3).
 
-Секреты LiveKit **никогда** не попадают в приложение: ни в renderer, ни в preload, ни в переменные Vite.
-Пока секреты не заданы, приложение честно показывает «Голосовой сервер LiveKit не настроен», а не имитирует связь.
+Необязательно: TURN Cloudflare для сетей, где закрыт UDP (Realtime → TURN → Create key) — секреты
+`CF_TURN_KEY_ID` и `CF_TURN_KEY_API_TOKEN`. Без них используется STUN `stun.cloudflare.com`.
 
-Можно использовать и self-hosted LiveKit — укажите его `wss://` адрес в `LIVEKIT_URL`.
+Ключи SFU **никогда** не попадают в приложение: ни в renderer, ни в preload, ни в переменные Vite, ни в GitHub.
+Пока они не заданы, приложение честно показывает «Голосовой сервер Cloudflare Realtime не настроен», а не имитирует связь.
+
+**Тарифы (проверено по документации Cloudflare):** первые 1 000 ГБ исходящего трафика Realtime (SFU и TURN вместе)
+в месяц бесплатны, сверх — $0,05 за ГБ; входящий трафик (публикация) бесплатен. Ограничений по числу участников,
+комнат или длительности приложение не вводит. Расход Realtime — одна строка в счёте Cloudflare (Billing).
+Отдельной аналитики и уведомлений о расходе именно для SFU в документации Cloudflare нет (для TURN есть аналитика
+через GraphQL API), поэтому расход стоит изредка проверять в разделе Billing.
+
+**Реальная проверка связи:** создайте локальный файл `.env.sfu-test` (в `.gitignore`) с `CF_SFU_APP_ID=` и
+`CF_SFU_APP_TOKEN=` и выполните `npm run test:sfu-live` — два участника в настоящем Chromium соединятся через
+Cloudflare SFU и проверят звук, демонстрацию экрана, mute, восстановление и выход.
 
 ---
 
@@ -159,7 +174,7 @@ Workflow `.github/workflows/build-windows.yml` собирает установщ
 
 Исходники: публичный (только для просмотра) репозиторий `realityunrealengine-cell/realism-voice` (`origin`).
 Обновления: публичный `realityunrealengine-cell/realism-voice-releases`, только установщики и `latest.yml`; приложение читает их без токена.
-Секреты (токен релизов, ключ подписи обновлений, ключи LiveKit) хранятся только в GitHub Secrets и Supabase — в репозитории их нет.
+Секреты (токен релизов, ключ подписи обновлений, ключи Cloudflare Realtime SFU) хранятся только в GitHub Secrets и Supabase — в репозитории их нет.
 
 1. Включите двухфакторную защиту GitHub.
 2. Создайте Fine-grained token (**Settings → Developer settings → Personal access tokens**): доступ только к
@@ -220,7 +235,7 @@ npm run update-test:serve
 
 ### Подпись и безопасность
 
-- Токены GitHub, ключи Supabase service_role и секреты LiveKit в приложение не попадают; `check-release.mjs post` проверяет `app-update.yml`.
+- Токены GitHub, ключи Supabase service_role и ключи Cloudflare Realtime SFU в приложение не попадают; `check-release.mjs post` проверяет `app-update.yml`.
 - **Подпись манифеста (без сертификата).** CI подписывает `latest.yml` ключом Ed25519 из секрета `UPDATE_SIGNING_KEY`, публичные ключи закреплены
   в `package.json` (`updatePublicKeys`) и попадают внутрь приложения. Перед скачиванием приложение проверяет подпись версии, файлов, SHA-512, размера и описания:
   неподписанное или изменённое обновление отклоняется. Манифест содержит SHA-512, поэтому заменить установщик незаметно тоже нельзя.
@@ -300,8 +315,8 @@ Supabase Free: **файл до 50 МБ**, хранилище **1 ГБ на ве�
 
 ```
 electron/        main-процесс, preload, шифрованное хранилище сессии, PTT, настройки
-src/             интерфейс (React), stores (Zustand), lib (Supabase, Realtime, LiveKit-шлюз)
-supabase/        migrations/*.sql, setup.sql, functions/livekit-token
+src/             интерфейс (React), stores (Zustand), lib (Supabase, Realtime, клиент Cloudflare Realtime SFU)
+supabase/        migrations/*.sql, setup.sql, functions/voice-sfu (и прежняя livekit-token)
 scripts/         генерация иконок, склейка SQL, тест RLS
 ```
 
@@ -322,8 +337,9 @@ scripts/         генерация иконок, склейка SQL, тест R
   новые переписки (30/час), серверы (10/сутки), медленный режим каналов;
 - Realtime: postgres_changes фильтруются RLS, приватные каналы набора текста / presence — политиками `realtime.messages`.
 
-**Голос:** Edge Function проверяет JWT, членство на сервере, доступ к приватному каналу, право говорить и лимит участников —
-и только после этого выдаёт LiveKit-токен на конкретную комнату.
+**Голос:** Edge Function `voice-sfu` проверяет JWT, членство на сервере, доступ к приватному каналу и право говорить
+при входе и при каждой публикации и подписке; сессии SFU подписаны (HMAC) — чужими сессиями управлять нельзя,
+а подписаться можно только на треки своей комнаты.
 
 ---
 

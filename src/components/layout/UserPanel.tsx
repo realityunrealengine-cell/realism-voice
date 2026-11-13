@@ -1,9 +1,8 @@
 import { Headphones, HeadphoneOff, Mic, MicOff, Monitor, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff } from 'lucide-react';
 import { TONE_TEXT, VOICE_STATUS_UI } from '@/components/voice/voiceStatusUi';
 import { useConnectivity, useSyncView } from '@/stores/connectivity';
-import { ConnectionQuality } from 'livekit-client';
 import { useAuth } from '@/stores/auth';
-import { useVoice } from '@/stores/voice';
+import { useVoice, type Quality } from '@/stores/voice';
 import { useUi } from '@/stores/ui';
 import { usePresence } from '@/stores/presence';
 import { Avatar } from '@/components/ui/Avatar';
@@ -14,12 +13,12 @@ import { CallTimer } from '@/components/voice/CallTimer';
 import { UpdatesButton } from '@/components/settings/UpdatesSection';
 import { toast } from '@/stores/ui';
 
-export const QUALITY: Record<ConnectionQuality, { label: string; color: string }> = {
-  [ConnectionQuality.Excellent]: { label: 'Отличное соединение', color: 'text-emerald-400' },
-  [ConnectionQuality.Good]: { label: 'Хорошее соединение', color: 'text-lime-300' },
-  [ConnectionQuality.Poor]: { label: 'Плохое соединение', color: 'text-amber-400' },
-  [ConnectionQuality.Lost]: { label: 'Соединение потеряно', color: 'text-rose-400' },
-  [ConnectionQuality.Unknown]: { label: 'Качество неизвестно', color: 'text-slate-400' },
+export const QUALITY: Record<Quality, { label: string; color: string }> = {
+  excellent: { label: 'Отличное соединение', color: 'text-emerald-400' },
+  good: { label: 'Хорошее соединение', color: 'text-lime-300' },
+  poor: { label: 'Плохое соединение', color: 'text-amber-400' },
+  lost: { label: 'Соединение потеряно', color: 'text-rose-400' },
+  unknown: { label: 'Качество неизвестно', color: 'text-slate-400' },
 };
 
 function VoiceStatus() {

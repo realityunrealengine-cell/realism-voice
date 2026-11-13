@@ -214,7 +214,7 @@ export function AboutSection() {
           <span className="text-slate-400">Node.js</span>
           <span className="text-slate-200">{v?.node ?? '—'}</span>
           <span className="text-slate-400">Голосовой движок</span>
-          <span className="text-slate-200">LiveKit (WebRTC SFU)</span>
+          <span className="text-slate-200">Cloudflare Realtime SFU (WebRTC)</span>
           <span className="text-slate-400">Сервер данных</span>
           <span className="text-slate-200">Supabase</span>
         </div>

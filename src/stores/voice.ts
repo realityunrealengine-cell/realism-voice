@@ -1,33 +1,28 @@
-// Голосовая связь, видео и демонстрация экрана через LiveKit (WebRTC SFU).
-// Токен доступа выдаёт Edge Function livekit-token после проверки прав в базе.
+// Голосовая связь, видео и демонстрация экрана через Cloudflare Realtime SFU (WebRTC).
+// Права и сессии SFU выдаёт Edge Function voice-sfu после проверки доступа в базе; состав комнаты
+// участники сообщают друг другу через Supabase Realtime Presence (src/lib/sfu/*).
 //
 // Состояния: idle → connecting → connected ⇄ reconnecting → lost (соединение потеряно) / error (не удалось подключиться).
 // Каждое подключение имеет «поколение» (ConnectionGeneration): если пользователь вышел или переключил канал,
-// пока шло подключение, устаревшая комната разрывается, а не остаётся «призраком» в канале.
+// пока шло подключение, устаревший сеанс закрывается, а не остаётся «призраком» в канале.
 import { create } from 'zustand';
-import {
-  ConnectionQuality,
-  DisconnectReason,
-  LocalAudioTrack,
-  Participant,
-  RemoteParticipant,
-  RemoteTrack,
-  Room,
-  RoomEvent,
-  ScreenSharePresets,
-  Track,
-  VideoPresets,
-} from 'livekit-client';
 import { supabase } from '@/lib/supabase';
-import { functionErrorMessage } from '@/lib/errors';
 import { VoiceGate } from '@/lib/voiceGate';
 import { sounds } from '@/lib/sounds';
-import { ConnectionGeneration, StaleConnectionError, nextReconnect } from '@/lib/reconnectPolicy';
+import { ConnectionGeneration, StaleConnectionError } from '@/lib/reconnectPolicy';
 import type { LiveParticipant } from '@/lib/voiceRoster';
+import { voiceApi } from '@/lib/sfu/api';
+import { voiceRealtime } from '@/lib/sfu/realtime';
+import { AudioOut } from '@/lib/sfu/audioOut';
+import { RoomFullError, SfuCall, type CallDeps } from '@/lib/sfu/call';
+import { ClosedError } from '@/lib/sfu/peer';
+import type { Quality, RoomMember, Source } from '@/lib/sfu/protocol';
 import { useSettings } from './settings';
 import { usePresence } from './presence';
 import { useMessages } from './messages';
 import { toast } from './ui';
+
+export type { Quality } from '@/lib/sfu/protocol';
 
 export type VoiceTarget =
   | { kind: 'channel'; serverId: string; channelId: string; name: string }
@@ -39,9 +34,9 @@ export interface ParticipantView {
   isLocal: boolean;
   speaking: boolean;
   micMuted: boolean;
-  quality: ConnectionQuality;
-  camera: Track | null;
-  screen: Track | null;
+  quality: Quality;
+  camera: MediaStreamTrack | null;
+  screen: MediaStreamTrack | null;
   hasScreenAudio: boolean;
   joinedAt: number | null;
 }
@@ -62,7 +57,7 @@ interface VoiceState {
   screen: boolean;
   transmitting: boolean;
   level: number;
-  quality: ConnectionQuality;
+  quality: Quality;
   pttPressed: boolean;
   /** Начало разговора; при переподключении не сбрасывается */
   connectedAt: number | null;
@@ -79,37 +74,43 @@ interface VoiceState {
   setPtt: (pressed: boolean) => void;
   applyPrefs: () => Promise<void>;
   applyVolumes: () => void;
-  /** Сеть или система вернулись (resume/online): проверить комнату */
+  /** Сеть или система вернулись (resume/online): проверить соединение */
   onConnectivityRestored: () => void;
 }
 
-let room: Room | null = null;
+/** Зависимости сеанса (подменяются в тестах) */
+export const voiceDeps: { make: (target: VoiceTarget, userId: string, session: string, ev: ConstructorParameters<typeof SfuCall>[3]) => SfuCall; deps: () => CallDeps } = {
+  deps: () => ({ api: voiceApi, rt: voiceRealtime(), log: (m) => import.meta.env.DEV && console.debug('[voice]', m) }),
+  make: (target, userId, session, ev) =>
+    new SfuCall(target.kind === 'channel' ? { kind: 'channel', channelId: target.channelId } : { kind: 'dm', dmId: target.dmId }, userId, session, ev, voiceDeps.deps()),
+};
+
+/** Экземпляр приложения: отличает это устройство от других устройств того же пользователя */
+const CLIENT = crypto.randomUUID();
+
+let call: SfuCall | null = null;
+let myId: string | null = null;
 let gate: VoiceGate | null = null;
+let micRaw: MediaStreamTrack | null = null;
+let cameraTrack: MediaStreamTrack | null = null;
+let screenStream: MediaStream | null = null;
 let audioCtx: AudioContext | null = null;
-let audioHost: HTMLDivElement | null = null;
+let out: AudioOut | null = null;
 let lastLevelPush = 0;
+let speaking = new Set<string>();
+let knownOthers: Set<string> | null = null;
+const remoteVideo = new Map<string, { camera: MediaStreamTrack | null; screen: MediaStreamTrack | null; screenAudio: boolean }>();
 const generation = new ConnectionGeneration();
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectStartedAt = 0;
-let networkWaiter: (() => void) | null = null;
 
-function host(): HTMLDivElement {
-  if (!audioHost) {
-    audioHost = document.createElement('div');
-    audioHost.style.display = 'none';
-    audioHost.id = 'rv-audio-host';
-    document.body.appendChild(audioHost);
-  }
-  return audioHost;
-}
-
-function captureOptions() {
+function micConstraints(deviceId?: string): MediaTrackConstraints {
   const p = useSettings.getState().prefs;
+  const id = deviceId ?? p.inputDeviceId;
   return {
-    deviceId: p.inputDeviceId && p.inputDeviceId !== 'default' ? p.inputDeviceId : undefined,
+    deviceId: id && id !== 'default' ? { exact: id } : undefined,
     echoCancellation: p.echoCancellation,
     noiseSuppression: p.noiseSuppression,
     autoGainControl: p.autoGainControl,
+    channelCount: 1,
   };
 }
 
@@ -123,14 +124,23 @@ function gateConfig() {
   } as const;
 }
 
-function cameraResolution() {
+/** Параметры камеры и демонстрации (те же разрешения и битрейты, что были в LiveKit) */
+function cameraPreset() {
   const q = useSettings.getState().prefs.cameraQuality;
-  return q === '1080p' ? VideoPresets.h1080.resolution : q === '480p' ? VideoPresets.h540.resolution : VideoPresets.h720.resolution;
+  return q === '1080p'
+    ? { width: 1920, height: 1080, fps: 30, bitrate: 3_000_000 }
+    : q === '480p'
+      ? { width: 960, height: 540, fps: 25, bitrate: 800_000 }
+      : { width: 1280, height: 720, fps: 30, bitrate: 1_700_000 };
 }
 
 function screenPreset() {
   const q = useSettings.getState().prefs.screenQuality;
-  return q === '1080p60' ? ScreenSharePresets.h1080fps30 : q === '720p' ? ScreenSharePresets.h720fps30 : ScreenSharePresets.h1080fps15;
+  return q === '1080p60'
+    ? { width: 1920, height: 1080, fps: 30, bitrate: 5_000_000 }
+    : q === '720p'
+      ? { width: 1280, height: 720, fps: 30, bitrate: 2_000_000 }
+      : { width: 1920, height: 1080, fps: 15, bitrate: 2_500_000 };
 }
 
 function mediaErrorMessage(e: unknown): string {
@@ -148,38 +158,65 @@ function sameTarget(a: VoiceTarget | null, b: VoiceTarget | null): boolean {
   return false;
 }
 
-/** Участники комнаты LiveKit в формате списка голосового канала */
+/** Участники комнаты в формате списка голосового канала */
 export function liveParticipants(list: ParticipantView[]): LiveParticipant[] {
   return list.map((p) => ({ identity: p.identity, micMuted: p.micMuted, camera: !!p.camera, screen: !!p.screen, joinedAt: p.joinedAt }));
 }
 
+async function getMicTrack(): Promise<MediaStreamTrack> {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+    return s.getAudioTracks()[0];
+  } catch (e) {
+    // Выбранный микрофон отключён — берём устройство по умолчанию
+    const name = (e as { name?: string })?.name;
+    if ((name === 'OverconstrainedError' || name === 'NotFoundError') && useSettings.getState().prefs.inputDeviceId !== 'default') {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints('default') });
+      return s.getAudioTracks()[0];
+    }
+    throw e;
+  }
+}
+
 export const useVoice = create<VoiceState>((set, get) => {
   const sync = () => {
-    if (!room) {
+    const c = call;
+    if (!c || !myId) {
       set({ participants: [] });
       return;
     }
-    const views: ParticipantView[] = [];
-    const add = (p: Participant, isLocal: boolean) => {
-      const cam = p.getTrackPublication(Track.Source.Camera);
-      const scr = p.getTrackPublication(Track.Source.ScreenShare);
-      const scrAudio = p.getTrackPublication(Track.Source.ScreenShareAudio);
+    const s = get();
+    const screenVideo = screenStream?.getVideoTracks()[0] ?? null;
+    const views: ParticipantView[] = [
+      {
+        identity: myId,
+        name: myId,
+        isLocal: true,
+        speaking: s.transmitting && !s.muted,
+        micMuted: s.muted || !s.canSpeak,
+        quality: s.quality,
+        camera: s.camera ? cameraTrack : null,
+        screen: s.screen ? screenVideo : null,
+        hasScreenAudio: !!screenStream?.getAudioTracks().length,
+        joinedAt: s.connectedAt,
+      },
+    ];
+    for (const m of c.others) {
+      const v = remoteVideo.get(m.userId);
       views.push({
-        identity: p.identity,
-        name: p.name || p.identity,
-        isLocal,
-        speaking: isLocal ? get().transmitting && !get().muted : p.isSpeaking,
-        micMuted: isLocal ? get().muted || !get().canSpeak : !p.isMicrophoneEnabled,
-        quality: p.connectionQuality,
-        camera: cam && !cam.isMuted && cam.track ? cam.track : null,
-        screen: scr && !scr.isMuted && scr.track ? scr.track : null,
-        hasScreenAudio: !!scrAudio?.track,
-        joinedAt: p.joinedAt ? p.joinedAt.getTime() : isLocal ? get().connectedAt : null,
+        identity: m.userId,
+        name: m.userId,
+        isLocal: false,
+        speaking: speaking.has(m.userId),
+        micMuted: m.muted || !m.tracks.some((t) => t.source === 'mic'),
+        quality: m.quality,
+        camera: v?.camera && m.tracks.some((t) => t.source === 'camera') ? v.camera : null,
+        screen: v?.screen && m.tracks.some((t) => t.source === 'screen') ? v.screen : null,
+        hasScreenAudio: !!v?.screenAudio,
+        joinedAt: m.joinedAt,
       });
-    };
-    add(room.localParticipant, true);
-    for (const p of room.remoteParticipants.values()) add(p, false);
-    set({ participants: views, quality: room.localParticipant.connectionQuality });
+    }
+    set({ participants: views });
   };
 
   const pushPresence = () => {
@@ -197,30 +234,27 @@ export const useVoice = create<VoiceState>((set, get) => {
     }
   };
 
-  const applyRemoteVolume = (p: RemoteParticipant) => {
+  const volumeOf = (userId: string, source: Source) => {
     const prefs = useSettings.getState().prefs;
-    const userPct = prefs.userVolumes[p.identity] ?? 100;
-    const v = get().deafened ? 0 : (userPct / 100) * (prefs.outputVolume / 100);
-    p.setVolume(v, Track.Source.Microphone);
-    p.setVolume(get().deafened ? 0 : prefs.outputVolume / 100, Track.Source.ScreenShareAudio);
+    if (get().deafened) return 0;
+    if (source === 'mic') return ((prefs.userVolumes[userId] ?? 100) / 100) * (prefs.outputVolume / 100);
+    return prefs.outputVolume / 100;
   };
 
-  const fetchToken = async (target: VoiceTarget) => {
-    const body = target.kind === 'channel' ? { channel_id: target.channelId } : { dm_id: target.dmId };
-    const { data, error } = await supabase.functions.invoke('livekit-token', { body });
-    if (error) throw new Error(await functionErrorMessage(error));
-    if (!data?.token || !data?.url) throw new Error('Сервер не вернул токен LiveKit');
-    return data as { token: string; url: string; can_speak: boolean };
+  const updatePtt = () => {
+    const prefs = useSettings.getState().prefs;
+    const active = !!call && prefs.voiceMode === 'ptt';
+    if (active) void useSettings.getState().setApp({ ptt: prefs.pttBinding });
+    window.rv?.ptt.setActive(active);
   };
 
-  const publishMic = async () => {
-    if (!room || !get().canSpeak) return;
-    await room.localParticipant.setMicrophoneEnabled(true, captureOptions());
-    const pub = room.localParticipant.getTrackPublication(Track.Source.Microphone);
-    const track = pub?.track as LocalAudioTrack | undefined;
-    if (!track) return;
-    gate = new VoiceGate(gateConfig());
-    gate.onLevel = (db, open) => {
+  /** Микрофон: захват → шлюз VAD/PTT → постоянный трек для отправки */
+  const startMic = async (c: SfuCall): Promise<MediaStreamTrack | null> => {
+    if (!audioCtx) return null;
+    const raw = await getMicTrack();
+    const g = new VoiceGate(gateConfig());
+    g.onLevel = (db, open) => {
+      if (gate !== g) return;
       const now = performance.now();
       if (open !== get().transmitting) {
         set({ transmitting: open });
@@ -231,157 +265,118 @@ export const useVoice = create<VoiceState>((set, get) => {
         set({ level: db });
       }
     };
-    await track.setAudioContext(audioCtx!);
-    await track.setProcessor(gate);
-    if (get().muted) await track.mute();
+    await g.init({ track: raw, audioContext: audioCtx });
+    if (call !== c) {
+      // Сеанс уже закрыт (выход во время запроса доступа к микрофону) — ничего не оставляем открытым
+      void g.destroy();
+      raw.stop();
+      return null;
+    }
+    stopMic();
+    micRaw = raw;
+    gate = g;
+    if (g.processedTrack) g.processedTrack.enabled = !get().muted;
+    return g.processedTrack ?? null;
   };
 
-  const clearReconnect = () => {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-    if (networkWaiter) window.removeEventListener('online', networkWaiter);
-    networkWaiter = null;
-  };
-
-  const cleanupRoom = () => {
+  const stopMic = () => {
+    void gate?.destroy();
     gate = null;
-    if (audioHost) audioHost.innerHTML = '';
-    room?.removeAllListeners();
-    room = null;
-    window.rv?.ptt.setActive(false);
+    micRaw?.stop();
+    micRaw = null;
   };
 
-  const updatePtt = () => {
-    const prefs = useSettings.getState().prefs;
-    const active = !!room && prefs.voiceMode === 'ptt';
-    if (active) void useSettings.getState().setApp({ ptt: prefs.pttBinding });
-    window.rv?.ptt.setActive(active);
+  const stopCamera = () => {
+    cameraTrack?.stop();
+    cameraTrack = null;
   };
+
+  const stopScreenMedia = () => {
+    screenStream?.getTracks().forEach((t) => t.stop());
+    screenStream = null;
+  };
+
+  /** Полная очистка: сеанс, RTCPeerConnection, медиапотоки, воспроизведение */
+  const teardown = async () => {
+    const c = call;
+    call = null;
+    knownOthers = null;
+    speaking = new Set();
+    remoteVideo.clear();
+    out?.clear();
+    stopMic();
+    stopCamera();
+    stopScreenMedia();
+    window.rv?.ptt.setActive(false);
+    await c?.close().catch(() => undefined);
+  };
+
+  const events = (h: { c: SfuCall | null }): ConstructorParameters<typeof SfuCall>[3] => ({
+    roster: (others: RoomMember[]) => {
+      if (call !== h.c) return;
+      const ids = new Set(others.map((o) => o.userId));
+      if (knownOthers && get().status === 'connected') {
+        if ([...ids].some((id) => !knownOthers!.has(id))) sounds.join();
+        if ([...knownOthers].some((id) => !ids.has(id))) sounds.leave();
+      }
+      knownOthers = ids;
+      for (const id of [...remoteVideo.keys()]) if (!ids.has(id)) remoteVideo.delete(id);
+      sync();
+    },
+    track: (userId, source, track) => {
+      if (call !== h.c) return;
+      const key = `${userId}:${source}`;
+      if (source === 'mic' || source === 'screenAudio') {
+        if (track && out) out.add(key, userId, source, track);
+        else out?.remove(key);
+        if (source === 'screenAudio') {
+          const v = remoteVideo.get(userId) ?? { camera: null, screen: null, screenAudio: false };
+          remoteVideo.set(userId, { ...v, screenAudio: !!track });
+        }
+      } else {
+        const v = remoteVideo.get(userId) ?? { camera: null, screen: null, screenAudio: false };
+        remoteVideo.set(userId, { ...v, [source]: track });
+      }
+      sync();
+    },
+    status: (status, attempt) => {
+      if (call !== h.c) return;
+      const s = get().status;
+      if (s !== 'connected' && s !== 'reconnecting') return;
+      set({ status, reconnectAttempt: attempt });
+      sync();
+      pushPresence();
+    },
+    lost: () => {
+      if (call === h.c) giveUp();
+    },
+    superseded: () => {
+      if (call === h.c) void endExternally('Вы подключились к голосовой связи с другого устройства — здесь соединение закрыто');
+    },
+    speaking: (ids) => {
+      if (call !== h.c) return;
+      speaking = ids;
+      sync();
+    },
+    quality: (q) => {
+      if (call !== h.c) return;
+      set({ quality: q });
+      sync();
+    },
+  });
 
   /** Отключение не по воле пользователя, без автоматического повтора */
-  const endExternally = (notice: string) => {
+  const endExternally = async (notice: string) => {
     generation.invalidate();
-    clearReconnect();
-    cleanupRoom();
+    await teardown();
     set({ status: 'idle', target: null, participants: [], connectedAt: null, camera: false, screen: false, transmitting: false, notice, reconnectAttempt: 0 });
     pushPresence();
     toast.info(notice);
   };
 
-  const connect = async (target: VoiceTarget, gen: number) => {
-    const ensureCurrent = async (r: Room | null) => {
-      if (generation.isCurrent(gen)) return;
-      if (r) {
-        r.removeAllListeners();
-        if (room === r) room = null;
-        await r.disconnect().catch(() => undefined);
-      }
-      throw new StaleConnectionError();
-    };
-
-    const { token, url, can_speak } = await fetchToken(target);
-    await ensureCurrent(null);
-    audioCtx ??= new AudioContext({ latencyHint: 'interactive' });
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
-    const prefs = useSettings.getState().prefs;
-    const r = new Room({
-      adaptiveStream: true,
-      dynacast: true,
-      webAudioMix: { audioContext: audioCtx },
-      disconnectOnPageLeave: true,
-      audioCaptureDefaults: captureOptions(),
-      audioOutput: prefs.outputDeviceId && prefs.outputDeviceId !== 'default' ? { deviceId: prefs.outputDeviceId } : undefined,
-      publishDefaults: { dtx: true, red: true, screenShareEncoding: screenPreset().encoding },
-    });
-    // Комната становится текущей до connect(): дорожки, подписанные во время подключения, должны прикрепиться
-    room = r;
-
-    r.on(RoomEvent.TrackSubscribed, (track: RemoteTrack, _pub, participant: RemoteParticipant) => {
-      if (room !== r) return;
-      if (track.kind === Track.Kind.Audio) {
-        const el = track.attach();
-        el.dataset.identity = participant.identity;
-        host().appendChild(el);
-        applyRemoteVolume(participant);
-      }
-      sync();
-    });
-    r.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
-      track.detach().forEach((el) => el.remove());
-      if (room === r) sync();
-    });
-    r.on(RoomEvent.ParticipantConnected, (p) => {
-      if (room !== r) return;
-      sounds.join();
-      applyRemoteVolume(p);
-      sync();
-    });
-    r.on(RoomEvent.ParticipantDisconnected, () => {
-      if (room !== r) return;
-      sounds.leave();
-      sync();
-    });
-    for (const ev of [
-      RoomEvent.TrackMuted, RoomEvent.TrackUnmuted, RoomEvent.LocalTrackPublished, RoomEvent.LocalTrackUnpublished,
-      RoomEvent.TrackPublished, RoomEvent.TrackUnpublished, RoomEvent.ActiveSpeakersChanged, RoomEvent.ConnectionQualityChanged,
-      RoomEvent.ParticipantNameChanged,
-    ] as const) {
-      r.on(ev, () => room === r && sync());
-    }
-    r.on(RoomEvent.LocalTrackUnpublished, (pub) => {
-      if (room !== r) return;
-      if (pub.source === Track.Source.ScreenShare) {
-        set({ screen: false });
-        pushPresence();
-      }
-      if (pub.source === Track.Source.Camera) {
-        set({ camera: false });
-        pushPresence();
-      }
-    });
-    // Короткие сбои LiveKit восстанавливает сам — показываем «Переподключение», присутствие сохраняем
-    r.on(RoomEvent.Reconnecting, () => room === r && set({ status: 'reconnecting' }));
-    r.on(RoomEvent.Reconnected, () => {
-      if (room !== r) return;
-      set({ status: 'connected', reconnectAttempt: 0 });
-      sync();
-      pushPresence();
-    });
-    r.on(RoomEvent.MediaDevicesError, (e) => toast.error('Ошибка устройства', mediaErrorMessage(e)));
-    r.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
-      if (room !== r || !generation.isCurrent(gen)) return;
-      cleanupRoom();
-      if (reason === DisconnectReason.CLIENT_INITIATED) return;
-      if (reason === DisconnectReason.DUPLICATE_IDENTITY) {
-        endExternally('Вы подключились к голосовой связи с другого устройства — здесь соединение закрыто');
-        return;
-      }
-      if (reason === DisconnectReason.PARTICIPANT_REMOVED || reason === DisconnectReason.ROOM_DELETED) {
-        endExternally('Вы отключены от голосового канала');
-        return;
-      }
-      startReconnect(target);
-    });
-
-    await r.connect(url, token, { autoSubscribe: true });
-    await ensureCurrent(r);
-    set({ canSpeak: !!can_speak });
-    await r.startAudio().catch(() => undefined);
-    try {
-      await publishMic();
-    } catch (e) {
-      toast.error('Микрофон недоступен', mediaErrorMessage(e));
-      set({ muted: true });
-    }
-    await ensureCurrent(r);
-    for (const p of r.remoteParticipants.values()) applyRemoteVolume(p);
-    sync();
-  };
-
   const giveUp = () => {
-    clearReconnect();
     generation.invalidate();
-    cleanupRoom();
+    void teardown();
     set({
       status: 'lost',
       error: 'Соединение с голосовым сервером потеряно. Проверьте интернет и нажмите «Переподключиться».',
@@ -396,54 +391,48 @@ export const useVoice = create<VoiceState>((set, get) => {
     pushPresence();
   };
 
-  const scheduleAttempt = (target: VoiceTarget) => {
-    const attempt = get().reconnectAttempt;
-    const d = nextReconnect(attempt, reconnectStartedAt, Date.now(), navigator.onLine);
-    if (d.action === 'give-up') {
-      giveUp();
-      return;
-    }
-    if (d.action === 'wait-network') {
-      networkWaiter = () => {
-        clearReconnect();
-        scheduleAttempt(target);
-      };
-      window.addEventListener('online', networkWaiter);
-      reconnectTimer = setTimeout(() => {
-        clearReconnect();
-        giveUp();
-      }, d.delayMs);
-      return;
-    }
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      if (!sameTarget(get().target, target) || get().status !== 'reconnecting') return;
-      const gen = generation.next();
-      set({ reconnectAttempt: attempt + 1 });
-      connect(target, gen)
-        .then(() => {
-          if (!generation.isCurrent(gen)) return;
-          set({ status: 'connected', error: null, reconnectAttempt: 0 });
-          updatePtt();
-          pushPresence();
-        })
-        .catch((e) => {
-          if (e instanceof StaleConnectionError || !generation.isCurrent(gen)) return;
-          const failed = room;
-          cleanupRoom();
-          void failed?.disconnect().catch(() => undefined);
-          scheduleAttempt(target);
-        });
-    }, d.delayMs);
-  };
+  const connect = async (target: VoiceTarget, gen: number) => {
+    const ensureCurrent = async () => {
+      if (generation.isCurrent(gen)) return;
+      throw new StaleConnectionError();
+    };
+    const { data } = await supabase.auth.getSession();
+    const userId = data.session?.user.id;
+    if (!userId) throw new Error('Требуется вход в аккаунт');
+    await ensureCurrent();
+    myId = userId;
+    audioCtx ??= new AudioContext({ latencyHint: 'interactive' });
+    if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => undefined);
+    out ??= new AudioOut(audioCtx);
+    out.setVolumes(volumeOf);
+    void out.setSink(useSettings.getState().prefs.outputDeviceId).catch(() => undefined);
 
-  const startReconnect = (target: VoiceTarget) => {
-    clearReconnect();
-    reconnectStartedAt = Date.now();
-    set({ status: 'reconnecting', reconnectAttempt: 0, camera: false, screen: false, transmitting: false });
+    const holder: { c: SfuCall | null } = { c: null };
+    const c = voiceDeps.make(target, userId, CLIENT, events(holder));
+    holder.c = c;
+    call = c;
+    // Сеанс сам захватывает микрофон после проверки прав (слушателю микрофон не нужен)
+    await c.start(async (canSpeak) => {
+      if (!canSpeak) return {};
+      try {
+        const track = await startMic(c);
+        if (call !== c) return {};
+        return track ? { mic: { track } } : {};
+      } catch (e) {
+        toast.error('Микрофон недоступен', mediaErrorMessage(e));
+        set({ muted: true });
+        return {};
+      }
+    });
+    if (call !== c || !generation.isCurrent(gen)) {
+      if (call === c) call = null;
+      await c.close();
+      throw new StaleConnectionError();
+    }
+    set({ canSpeak: c.canSpeak, quality: c.quality });
+    c.setFlags({ muted: get().muted || !c.canSpeak, deafened: get().deafened });
+    get().applyVolumes();
     sync();
-    // Присутствие оставляем: при быстром восстановлении у других не будет «мигания»
-    scheduleAttempt(target);
   };
 
   return {
@@ -459,7 +448,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     screen: false,
     transmitting: false,
     level: -100,
-    quality: ConnectionQuality.Unknown,
+    quality: 'unknown',
     pttPressed: false,
     connectedAt: null,
     reconnectAttempt: 0,
@@ -467,7 +456,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     join: async (target) => {
       const s = get();
       if (sameTarget(s.target, target) && (s.status === 'connected' || s.status === 'connecting' || s.status === 'reconnecting')) return;
-      if (room || s.target) await get().leave();
+      if (call || s.target) await get().leave();
       const gen = generation.next();
       set({ status: 'connecting', target, error: null, notice: null, camera: false, screen: false, transmitting: false, connectedAt: null, reconnectAttempt: 0 });
       pushPresence();
@@ -480,16 +469,14 @@ export const useVoice = create<VoiceState>((set, get) => {
         updatePtt();
         pushPresence();
         // Звонок в ЛС: если собеседника ещё нет в комнате — отправляем уведомление о звонке
-        if (target.kind === 'dm' && room && room.remoteParticipants.size === 0) {
+        if (target.kind === 'dm' && call && call.others.length === 0) {
           void useMessages.getState().send({ kind: 'dm', id: target.dmId }, '', [], null, 'call').catch(() => undefined);
         }
       } catch (e) {
-        if (e instanceof StaleConnectionError || !generation.isCurrent(gen)) return;
-        const msg = e instanceof Error ? e.message : String(e);
+        if (e instanceof StaleConnectionError || e instanceof ClosedError || !generation.isCurrent(gen)) return;
+        const msg = e instanceof RoomFullError ? 'Канал заполнен' : e instanceof Error ? e.message : String(e);
         generation.invalidate();
-        const r = room;
-        cleanupRoom();
-        await r?.disconnect().catch(() => undefined);
+        await teardown();
         set({ status: 'error', error: msg, participants: [], connectedAt: null });
         pushPresence();
       }
@@ -497,26 +484,19 @@ export const useVoice = create<VoiceState>((set, get) => {
 
     leave: async () => {
       generation.invalidate();
-      clearReconnect();
-      const r = room;
-      const wasConnected = !!r;
-      cleanupRoom();
+      const wasConnected = !!call && (get().status === 'connected' || get().status === 'reconnecting');
+      const pending = teardown();
       set({ status: 'idle', target: null, participants: [], camera: false, screen: false, transmitting: false, error: null, connectedAt: null, reconnectAttempt: 0 });
       pushPresence();
-      if (r) {
-        if (wasConnected) sounds.leave();
-        await r.disconnect().catch(() => undefined);
-      }
+      if (wasConnected) sounds.leave();
+      await pending;
     },
 
     retry: async () => {
       const t = get().target;
       if (!t) return;
-      clearReconnect();
       generation.invalidate();
-      const r = room;
-      cleanupRoom();
-      await r?.disconnect().catch(() => undefined);
+      await teardown();
       set({ status: 'idle' });
       await get().join(t);
     },
@@ -527,9 +507,14 @@ export const useVoice = create<VoiceState>((set, get) => {
       set({ muted, deafened: muted ? get().deafened : false });
       if (!muted) get().applyVolumes();
       muted ? sounds.mute() : sounds.unmute();
-      const pub = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
-      if (pub?.track) void (muted ? pub.mute() : pub.unmute());
-      else if (!muted && room && get().canSpeak) void publishMic().catch((e) => toast.error('Микрофон недоступен', mediaErrorMessage(e)));
+      if (gate?.processedTrack) gate.processedTrack.enabled = !muted;
+      else if (!muted && call && get().canSpeak) {
+        const c = call;
+        void startMic(c)
+          .then((track) => (track && call === c ? c.setSources({ mic: { track } }) : undefined))
+          .catch((e) => toast.error('Микрофон недоступен', mediaErrorMessage(e)));
+      }
+      call?.setFlags({ muted: muted || !get().canSpeak, deafened: get().deafened });
       sync();
       pushPresence();
     },
@@ -538,22 +523,46 @@ export const useVoice = create<VoiceState>((set, get) => {
       const deafened = !get().deafened;
       set({ deafened, muted: deafened ? true : get().muted });
       deafened ? sounds.mute() : sounds.unmute();
-      const pub = room?.localParticipant.getTrackPublication(Track.Source.Microphone);
-      if (pub?.track && deafened) void pub.mute();
+      if (deafened && gate?.processedTrack) gate.processedTrack.enabled = false;
       get().applyVolumes();
+      call?.setFlags({ muted: get().muted || !get().canSpeak, deafened });
       sync();
       pushPresence();
     },
 
     toggleCamera: async () => {
-      if (!room) return;
+      const c = call;
+      if (!c) return;
       const on = !get().camera;
       try {
-        const deviceId = useSettings.getState().prefs.videoDeviceId || undefined;
-        await room.localParticipant.setCameraEnabled(on, { deviceId, resolution: cameraResolution() });
-        set({ camera: on });
+        if (on) {
+          if (!c.canSpeak) throw new Error('В этом канале у вас режим слушателя');
+          const preset = cameraPreset();
+          const deviceId = useSettings.getState().prefs.videoDeviceId || undefined;
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: { ideal: preset.width }, height: { ideal: preset.height }, frameRate: { ideal: preset.fps } },
+          });
+          const track = stream.getVideoTracks()[0];
+          if (call !== c) {
+            track.stop();
+            return;
+          }
+          stopCamera();
+          cameraTrack = track;
+          track.addEventListener('ended', () => {
+            if (cameraTrack === track && get().camera) void get().toggleCamera();
+          });
+          await c.setSources({ camera: { track, encoding: { maxBitrate: preset.bitrate, maxFramerate: preset.fps } } });
+          set({ camera: true });
+        } else {
+          set({ camera: false });
+          await c.setSources({ camera: null }).catch(() => undefined);
+          stopCamera();
+        }
       } catch (e) {
         toast.error('Камера недоступна', mediaErrorMessage(e));
+        await c.setSources({ camera: null }).catch(() => undefined);
+        stopCamera();
         set({ camera: false });
       }
       sync();
@@ -561,18 +570,41 @@ export const useVoice = create<VoiceState>((set, get) => {
     },
 
     startScreen: async (sourceId, withAudio) => {
-      if (!room) return;
+      const c = call;
+      if (!c) return;
       try {
+        if (!c.canSpeak) throw new Error('В этом канале у вас режим слушателя');
         await window.rv?.screen.select(sourceId, withAudio);
         const preset = screenPreset();
-        await room.localParticipant.setScreenShareEnabled(
-          true,
-          { audio: withAudio, resolution: preset.resolution, contentHint: 'detail', systemAudio: withAudio ? 'include' : 'exclude' },
-          { screenShareEncoding: preset.encoding },
-        );
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: { ideal: preset.width }, height: { ideal: preset.height }, frameRate: { ideal: preset.fps, max: preset.fps } },
+          audio: withAudio ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
+        });
+        if (call !== c) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        if (screenStream) {
+          await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
+          stopScreenMedia();
+        }
+        screenStream = stream;
+        const video = stream.getVideoTracks()[0];
+        const audio = stream.getAudioTracks()[0];
+        video.contentHint = 'detail';
+        // Окно закрыто или демонстрацию остановила система
+        video.addEventListener('ended', () => {
+          if (screenStream === stream) void get().stopScreen();
+        });
+        await c.setSources({
+          screen: { track: video, encoding: { maxBitrate: preset.bitrate, maxFramerate: preset.fps } },
+          ...(audio ? { screenAudio: { track: audio } } : {}),
+        });
         set({ screen: true });
       } catch (e) {
         toast.error('Не удалось начать демонстрацию', (e as Error)?.message);
+        await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
+        stopScreenMedia();
         set({ screen: false });
       }
       sync();
@@ -580,9 +612,10 @@ export const useVoice = create<VoiceState>((set, get) => {
     },
 
     stopScreen: async () => {
-      if (!room) return;
-      await room.localParticipant.setScreenShareEnabled(false).catch(() => undefined);
+      const c = call;
       set({ screen: false });
+      if (c) await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
+      stopScreenMedia();
       sync();
       pushPresence();
     },
@@ -597,41 +630,45 @@ export const useVoice = create<VoiceState>((set, get) => {
       const prefs = useSettings.getState().prefs;
       gate?.setConfig(gateConfig());
       updatePtt();
-      if (!room) return;
+      if (!call) return;
       get().applyVolumes();
       try {
-        await room.switchActiveDevice('audiooutput', prefs.outputDeviceId || 'default');
+        await out?.setSink(prefs.outputDeviceId || 'default');
       } catch {
         /* устройство вывода может не поддерживаться */
       }
-      const track = room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track as LocalAudioTrack | undefined;
-      if (track) {
-        const opts = captureOptions();
-        const cur = track.mediaStreamTrack.getSettings();
+      if (gate && micRaw && audioCtx) {
+        const want = micConstraints();
+        const cur = micRaw.getSettings();
+        const wantId = (want.deviceId as { exact?: string } | undefined)?.exact ?? 'default';
         const needsRestart =
-          (opts.deviceId ?? 'default') !== (cur.deviceId ?? 'default') ||
-          cur.echoCancellation !== opts.echoCancellation ||
-          cur.noiseSuppression !== opts.noiseSuppression ||
-          cur.autoGainControl !== opts.autoGainControl;
-        if (needsRestart) await track.restartTrack(opts).catch((e) => toast.error('Микрофон', mediaErrorMessage(e)));
+          (wantId !== 'default' && wantId !== cur.deviceId) ||
+          cur.echoCancellation !== want.echoCancellation ||
+          cur.noiseSuppression !== want.noiseSuppression ||
+          cur.autoGainControl !== want.autoGainControl;
+        if (needsRestart) {
+          try {
+            const raw = await getMicTrack();
+            const old = micRaw;
+            // Отправляемый трек не меняется — меняется только вход шлюза, без нового согласования с SFU
+            await gate.restart({ track: raw, audioContext: audioCtx });
+            micRaw = raw;
+            old?.stop();
+          } catch (e) {
+            toast.error('Микрофон', mediaErrorMessage(e));
+          }
+        }
       }
     },
 
     applyVolumes: () => {
-      if (!room) return;
-      for (const p of room.remoteParticipants.values()) applyRemoteVolume(p);
+      out?.setVolumes(volumeOf);
     },
 
     onConnectivityRestored: () => {
       const s = get();
-      if (!s.target) return;
-      // Комната уже разорвана, а ожидание шло без сети — пробуем сразу
-      if (s.status === 'reconnecting' && !room && networkWaiter) {
-        const w = networkWaiter;
-        w();
-        return;
-      }
-      if (s.status === 'connected' && room && room.state === 'disconnected') startReconnect(s.target);
+      if (!s.target || !call) return;
+      if (s.status === 'connected' || s.status === 'reconnecting') call.onConnectivityRestored();
     },
   };
 });
