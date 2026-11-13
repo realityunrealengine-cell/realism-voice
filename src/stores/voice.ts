@@ -80,7 +80,12 @@ interface VoiceState {
 
 /** Зависимости сеанса (подменяются в тестах) */
 export const voiceDeps: { make: (target: VoiceTarget, userId: string, session: string, ev: ConstructorParameters<typeof SfuCall>[3]) => SfuCall; deps: () => CallDeps } = {
-  deps: () => ({ api: voiceApi, rt: voiceRealtime(), log: (m) => import.meta.env.DEV && console.debug('[voice]', m) }),
+  deps: () => ({
+    api: voiceApi,
+    rt: voiceRealtime(),
+    log: (m) => import.meta.env.DEV && console.debug('[voice]', m),
+    level: (userId) => out?.level(`${userId}:mic`) ?? null,
+  }),
   make: (target, userId, session, ev) =>
     new SfuCall(target.kind === 'channel' ? { kind: 'channel', channelId: target.channelId } : { kind: 'dm', dmId: target.dmId }, userId, session, ev, voiceDeps.deps()),
 };

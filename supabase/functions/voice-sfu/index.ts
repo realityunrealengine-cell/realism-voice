@@ -131,6 +131,7 @@ class Sfu {
     if (res.status === 401 || res.status === 403) {
       throw new HttpError(503, 'sfu_auth', 'Cloudflare Realtime отклонил ключи приложения. Проверьте секреты CF_SFU_APP_ID и CF_SFU_APP_TOKEN.');
     }
+    if (!res.ok) console.warn('sfu http', res.status, path.replace(/sessions\/[^/]+/, 'sessions/…'), data?.errorCode, data?.errorDescription);
     if (res.status === 404 && path === '/sessions/new') {
       throw new HttpError(503, 'sfu_auth', 'Cloudflare Realtime не нашёл приложение SFU. Проверьте секрет CF_SFU_APP_ID.');
     }

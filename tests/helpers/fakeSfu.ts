@@ -188,6 +188,9 @@ export class FakePC extends EventTarget {
     super();
     FakePC.all.push(this);
   }
+  getTransceivers() {
+    return this.transceivers;
+  }
   addTransceiver(track: FakeTrack, init: { direction: string }) {
     const t = new FakeTransceiver(track.kind, track, init.direction);
     this.transceivers.push(t);
@@ -267,6 +270,8 @@ interface FakeSession {
   published: Map<string, { mid: string; name: string; source: Source; closed: boolean }>;
   pulled: Map<string, { name: string; closed: boolean }>;
   nextMid: number;
+  /** Как у Cloudflare: после снятия последней медиалинии соединение закрыто, сессия больше не принимает треки */
+  dead: boolean;
 }
 
 export class FakeSfu {
@@ -279,10 +284,12 @@ export class FakeSfu {
   denied = new Set<string>();
   userLimit: number | null = null;
   failJoins = 0;
+  /** Сколько следующих подписок отклонить (трек ещё не активен у SFU) */
+  failSubscribes = 0;
 
   newSession(user: string, room: string, kind: 'pub' | 'sub'): SessionGrant {
     const id = `sess${++this.seq}xxxxxx`;
-    this.sessions.set(id, { id, user, room, kind, published: new Map(), pulled: new Map(), nextMid: 0 });
+    this.sessions.set(id, { id, user, room, kind, published: new Map(), pulled: new Map(), nextMid: 0, dead: false });
     return { id, token: `tok:${id}:${user}` };
   }
 
@@ -290,6 +297,26 @@ export class FakeSfu {
     const s = this.sessions.get(g.id);
     if (!s || g.token !== `tok:${g.id}:${user}` || s.kind !== kind) throw Object.assign(new Error('bad session'), { status: 403 });
     return s;
+  }
+
+  private alive(s: FakeSession) {
+    if (s.dead) throw Object.assign(new Error('Session appears to be disconnected'), { status: 410 });
+  }
+
+  /** Как в Chromium + Cloudflare: снятие первой действующей медиалинии (BUNDLE) разрывает транспорт */
+  private checkTag(s: FakeSession, mids: string[]) {
+    const active = s.kind === 'pub' ? [...s.published.values()].filter((t) => !t.closed).map((t) => t.mid) : [...s.pulled.entries()].filter(([, p]) => !p.closed).map(([m]) => m);
+    const tag = active.sort((x, y) => Number(x) - Number(y))[0];
+    if (tag !== undefined && mids.includes(tag)) s.dead = true;
+  }
+
+  private checkDead(s: FakeSession) {
+    const active = s.kind === 'pub' ? [...s.published.values()].some((t) => !t.closed) : [...s.pulled.values()].some((t) => !t.closed);
+    if (!active) s.dead = true;
+  }
+
+  deadSessions(): number {
+    return [...this.sessions.values()].filter((s) => s.dead).length;
   }
 
   activePublished(): { user: string; name: string; source: Source }[] {
@@ -328,6 +355,7 @@ export class FakeSfu {
       publish: async (g, sdp, tracks) => {
         this.calls.push(`${user}:publish:${tracks.map((t) => t.source).join(',')}`);
         const s = this.own(g, user, 'pub');
+        this.alive(s);
         if (this.listeners.has(user)) throw new Error('forbidden');
         const offer = parseFakeSdp(sdp);
         const named = tracks.map((t) => {
@@ -341,15 +369,23 @@ export class FakeSfu {
       unpublish: async (g, sdp, mids) => {
         this.calls.push(`${user}:unpublish`);
         const s = this.own(g, user, 'pub');
+        this.alive(s);
+        this.checkTag(s, mids);
         for (const m of mids) {
           const t = s.published.get(m);
           if (t) t.closed = true;
         }
+        this.checkDead(s);
         return { sdp: fakeSdp({ type: 'answer', mids: parseFakeSdp(sdp).mids }) };
       },
       subscribe: async (g, tracks) => {
         this.calls.push(`${user}:subscribe:${tracks.length}`);
         const s = this.own(g, user, 'sub');
+        this.alive(s);
+        if (this.failSubscribes > 0) {
+          this.failSubscribes--;
+          throw Object.assign(new Error('track not ready'), { status: 410 });
+        }
         const result = tracks.map((t) => {
           if (!t.name.startsWith(s.room + '.')) throw Object.assign(new Error('forbidden'), { status: 403 });
           const src = this.sessions.get(t.session);
@@ -374,10 +410,13 @@ export class FakeSfu {
       unsubscribe: async (g, sdp, mids) => {
         this.calls.push(`${user}:unsubscribe`);
         const s = this.own(g, user, 'sub');
+        this.alive(s);
+        this.checkTag(s, mids);
         for (const m of mids) {
           const p = s.pulled.get(m);
           if (p) p.closed = true;
         }
+        this.checkDead(s);
         return { sdp: fakeSdp({ type: 'answer', mids: parseFakeSdp(sdp).mids }) };
       },
       close: async (pub, sub) => {

@@ -31,6 +31,8 @@ export interface CallDeps {
   online?: () => boolean;
   onOnline?: (fn: () => void) => () => void;
   log?: (msg: string) => void;
+  /** Уровень принятого звука участника (RMS 0..1) — для индикатора «говорит» */
+  level?: (userId: string) => number | null;
 }
 
 export class RoomFullError extends Error {
@@ -77,6 +79,11 @@ export class SfuCall {
 
   private pub: Publisher | null = null;
   private sub: Subscriber | null = null;
+  /** Сессии, выданные при входе, но ещё не использованные (соединение создаётся только когда нужно) */
+  private pubGrant: SessionGrant | null = null;
+  private subGrant: SessionGrant | null = null;
+  private pubPending: Promise<Publisher | null> | null = null;
+  private subPending: Promise<Subscriber | null> | null = null;
   private config: RTCConfiguration = rtcConfig(null);
   private readonly local = new Map<Source, Omit<PublishItem, 'source'>>();
   private flags = { muted: false, deafened: false };
@@ -121,8 +128,8 @@ export class SfuCall {
     this.assertOpen();
     this.applyJoin(res);
     this.config = rtcConfig(res.ice_servers);
-    if (res.pub) this.pub = this.makePublisher(res.pub);
-    if (res.sub) this.sub = this.makeSubscriber(res.sub);
+    this.pubGrant = res.pub;
+    this.subGrant = res.sub;
     const localP: Promise<LocalSources> = provide ? provide(this.canSpeak).catch(() => ({})) : Promise.resolve({});
 
     // Присутствие в комнате: кто здесь и какие треки публикует
@@ -153,11 +160,12 @@ export class SfuCall {
     this.assertOpen();
     for (const [k, v] of Object.entries(initial) as [Source, Omit<PublishItem, 'source'>][]) if (v) this.local.set(k, v);
 
-    if (this.pub && this.canSpeak && this.local.size) {
-      await this.pub.publish(this.items());
+    const pub = this.canSpeak && this.local.size ? await this.ensurePub() : null;
+    if (pub) {
+      await pub.publish(this.items());
       this.assertOpen();
       this.pushPresence();
-      await waitConnected(this.pub.pc, MEDIA_TIMEOUT_MS).catch(() => {
+      await waitConnected(pub.pc, MEDIA_TIMEOUT_MS).catch(() => {
         throw new Error('Не удалось установить медиасоединение с Cloudflare Realtime. Возможно, сеть блокирует UDP.');
       });
     }
@@ -224,7 +232,100 @@ export class SfuCall {
     }
     this.ev.roster(this.others);
     for (const id of [...this.loudAt.keys()]) if (!this.others.some((o) => o.userId === id)) this.loudAt.delete(id);
-    this.sub?.setDesired(desiredTracks(this.others));
+    this.syncSub();
+  }
+
+  /**
+   * Подписки по составу комнаты. Если принимать больше нечего, сессия приёма закрывается целиком:
+   * соединение без единой медиалинии Cloudflare считает разорванным («Session appears to be
+   * disconnected»), новые подписки в него уже не пройдут. Новая сессия создаётся, когда снова понадобится.
+   */
+  private syncSub() {
+    if (this.closed) return;
+    const want = desiredTracks(this.others);
+    if (want.length === 0) {
+      if (this.sub?.pc) this.dropSub();
+      return;
+    }
+    if (this.sub) {
+      this.sub.setDesired(want);
+      return;
+    }
+    void this.ensureSub().catch((e) => {
+      if (e instanceof ClosedError || this.closed) return;
+      this.deps.log?.(`subscribe session failed: ${(e as Error)?.message}`);
+      this.recover('sub');
+    });
+  }
+
+  private async ensurePub(): Promise<Publisher | null> {
+    if (this.pub) return this.pub;
+    if (!this.canSpeak) return null;
+    this.pubPending ??= (async () => {
+      let grant = this.pubGrant;
+      this.pubGrant = null;
+      if (!grant) {
+        const res = await this.deps.api.join(this.target, 'pub');
+        this.assertOpen();
+        this.applyJoin(res);
+        grant = res.pub;
+      }
+      this.assertOpen();
+      if (!grant) return null;
+      this.pub = this.makePublisher(grant);
+      return this.pub;
+    })().finally(() => {
+      this.pubPending = null;
+    });
+    return this.pubPending;
+  }
+
+  private async ensureSub(): Promise<Subscriber | null> {
+    if (this.sub) return this.sub;
+    this.subPending ??= (async () => {
+      let grant = this.subGrant;
+      this.subGrant = null;
+      if (!grant) {
+        const res = await this.deps.api.join(this.target, 'sub');
+        this.assertOpen();
+        this.applyJoin(res);
+        grant = res.sub;
+      }
+      this.assertOpen();
+      if (!grant) return null;
+      const s = this.makeSubscriber(grant);
+      this.sub = s;
+      s.setDesired(desiredTracks(this.others));
+      return s;
+    })().finally(() => {
+      this.subPending = null;
+    });
+    return this.subPending;
+  }
+
+  private dropPub() {
+    const old = this.pub;
+    if (!old) return;
+    this.pub = null;
+    this.forget(old.pc);
+    const mids = old.close();
+    if (mids.length) void this.deps.api.close({ session: old.session, mids }, null).catch(() => undefined);
+  }
+
+  private dropSub() {
+    const old = this.sub;
+    if (!old) return;
+    this.sub = null;
+    if (old.pc) this.forget(old.pc);
+    const mids = old.close();
+    if (mids.length) void this.deps.api.close(null, { session: old.session, mids }).catch(() => undefined);
+  }
+
+  private forget(pc: RTCPeerConnection) {
+    const t = this.discTimers.get(pc);
+    if (t) clearTimeout(t);
+    this.discTimers.delete(pc);
+    this.counters.delete(pc);
   }
 
   // ---------- соединения ----------
@@ -340,69 +441,74 @@ export class SfuCall {
   private async rebuild(): Promise<void> {
     const scopes = new Set(this.pending);
     this.pending.clear();
-    const scope = scopes.has('pub') && scopes.has('sub') ? 'all' : scopes.has('pub') ? 'pub' : 'sub';
-    let res: JoinResult;
     try {
-      res = await this.deps.api.join(this.target, scope);
+      // Новые сессии SFU (права перепроверяются в Edge Function при выдаче)
+      if (scopes.has('sub')) {
+        this.dropSub();
+        this.subGrant = null;
+      }
+      if (scopes.has('pub')) {
+        this.dropPub();
+        this.pubGrant = null;
+        // Присутствие обновляется только после новой публикации: собеседник сначала подпишется на новые
+        // треки и лишь затем снимет старые — его соединение не останется без медиалиний.
+        if (this.canSpeak && this.local.size) {
+          const pub = await this.ensurePub();
+          if (pub) {
+            await pub.publish(this.items());
+            this.pushPresence();
+            await waitConnected(pub.pc, MEDIA_TIMEOUT_MS);
+          }
+        }
+        this.pushPresence();
+      }
+      if (scopes.has('sub') && desiredTracks(this.others).length) await this.ensureSub();
     } catch (e) {
-      for (const s of scopes) this.pending.add(s);
+      for (const sc of scopes) this.pending.add(sc);
       throw e;
     }
-    this.assertOpen();
-    this.applyJoin(res);
-    if (scopes.has('sub')) {
-      const old = this.sub;
-      const mids = old?.close() ?? [];
-      if (old && mids.length) void this.deps.api.close(null, { session: old.session, mids }).catch(() => undefined);
-      this.sub = res.sub ? this.makeSubscriber(res.sub) : null;
-      this.sub?.setDesired(desiredTracks(this.others));
-    }
-    if (scopes.has('pub')) {
-      const old = this.pub;
-      const mids = old?.close() ?? [];
-      if (old && mids.length) void this.deps.api.close({ session: old.session, mids }, null).catch(() => undefined);
-      this.pub = res.pub ? this.makePublisher(res.pub) : null;
-      this.pushPresence();
-      if (this.pub && this.canSpeak && this.local.size) {
-        try {
-          await this.pub.publish(this.items());
-          this.pushPresence();
-          await waitConnected(this.pub.pc, MEDIA_TIMEOUT_MS);
-        } catch (e) {
-          this.pending.add('pub');
-          throw e;
-        }
-      }
-    }
-    this.pushPresence();
   }
 
   // ---------- свои треки ----------
   /** Включить, заменить или убрать свои источники (null — убрать) */
   async setSources(changes: Partial<Record<Source, Omit<PublishItem, 'source'> | null>>): Promise<void> {
-    const add: PublishItem[] = [];
-    const remove: Source[] = [];
-    const replace: [Source, MediaStreamTrack][] = [];
     for (const [k, v] of Object.entries(changes) as [Source, Omit<PublishItem, 'source'> | null][]) {
-      const had = this.local.has(k);
-      if (v) {
-        this.local.set(k, v);
-        if (this.pub?.has(k)) replace.push([k, v.track]);
-        else add.push({ source: k, ...v });
-      } else {
-        this.local.delete(k);
-        if (had) remove.push(k);
-      }
+      if (v) this.local.set(k, v);
+      else this.local.delete(k);
     }
-    const pub = this.pub;
-    if (!pub || !this.canSpeak || this.closed) return;
+    if (!this.canSpeak || this.closed) return;
+    let pub: Publisher | null = this.pub;
     try {
-      for (const [s, t] of replace) await pub.replace(s, t);
-      if (remove.length) await pub.unpublish(remove);
-      if (add.length) await pub.publish(add);
+      if (this.local.size === 0) {
+        // Последний трек: соединение без медиалиний Cloudflare закрывает — закрываем сессию сами
+        if (this.pub) {
+          this.dropPub();
+          this.pushPresence();
+        }
+        return;
+      }
+      // Снятие трека с первой медиалинии разорвало бы транспорт — пересоздаём сессию публикации
+      const cur = this.pub;
+      if (cur && cur.tracks().some((t) => !this.local.has(t.source) && cur.holdsBundleTag(t.source))) {
+        this.dropPub();
+      }
+      pub = await this.ensurePub();
+      if (!pub) return;
+      const p = pub;
+      for (const [k, v] of Object.entries(changes) as [Source, Omit<PublishItem, 'source'> | null][]) {
+        if (v && p.has(k) && p.sender(k)?.track !== v.track) await p.replace(k, v.track);
+      }
+      const add = this.items().filter((i) => !p.has(i.source));
+      const remove = p
+        .tracks()
+        .map((t) => t.source)
+        .filter((src) => !this.local.has(src));
+      // Сначала добавить, потом снять: в соединении всегда остаётся хотя бы одна медиалиния
+      if (add.length) await p.publish(add);
+      if (remove.length) await p.unpublish(remove);
       this.pushPresence();
     } catch (e) {
-      if (e instanceof ClosedError || this.closed || pub !== this.pub) return;
+      if (e instanceof ClosedError || this.closed || (pub && pub !== this.pub)) return;
       this.deps.log?.(`publish failed: ${(e as Error)?.message}`);
       // Сессия публикации в неизвестном состоянии — заменяем её, треки опубликуются заново
       this.recover('pub');
@@ -428,9 +534,11 @@ export class SfuCall {
   private pollSpeaking() {
     if (!this.sub) return;
     const now = Date.now();
+    // Cloudflare SFU не пересылает расширение RTP с уровнем звука, поэтому основной источник —
+    // уровень самого принятого звука (Web Audio); уровень из RTP учитывается, если он всё же есть.
     for (const { ref, receiver } of this.sub.receivers()) {
       if (ref.source !== 'mic') continue;
-      let level = 0;
+      let level = this.deps.level?.(ref.userId) ?? 0;
       try {
         for (const s of receiver.getSynchronizationSources()) level = Math.max(level, s.audioLevel ?? 0);
       } catch {

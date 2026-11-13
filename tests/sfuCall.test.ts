@@ -22,6 +22,7 @@ interface Rec {
   superseded: number;
   speaking: Set<string>;
   quality: Quality[];
+  logs: string[];
 }
 
 let server: FakeRealtimeServer;
@@ -40,6 +41,7 @@ function make(user: string, session = `dev-${user.slice(-1)}`): Rec {
     superseded: 0,
     speaking: new Set<string>(),
     quality: [],
+    logs: [],
   } as unknown as Rec;
   const ev: CallEvents = {
     roster: (o) => rec.rosters.push(o),
@@ -55,6 +57,7 @@ function make(user: string, session = `dev-${user.slice(-1)}`): Rec {
     rt,
     pcFactory: (cfg) => new FakePC(cfg) as unknown as RTCPeerConnection,
     online: () => online,
+    log: (m) => rec.logs.push(m),
     onOnline: (fn) => {
       onlineListeners.push(fn);
       return () => (onlineListeners = onlineListeners.filter((f) => f !== fn));
@@ -205,9 +208,66 @@ describe('комната Cloudflare Realtime SFU', () => {
     const newName = sfu.activePublished().find((t) => t.user === U.A)!.name;
     expect(newName).not.toBe(oldName);
     expect(heard(b, U.A)).toBe(true);
-    expect(sfu.activePulls(U.B)).toEqual([newName]);
-    // У собеседника A ни разу не пропадал из списка
+    // Новый трек принят; старая первая медиалиния остаётся «опорой» транспорта (без пакетов — издатель закрыт)
+    expect(sfu.activePulls(U.B)).toContain(newName);
+    expect(sfu.activePulls(U.B)).toHaveLength(2);
+    // У собеседника A ни разу не пропадал из списка, а его сессия приёма не осталась без медиалиний
     expect(b.rosters.slice(rostersBefore).every((r) => r.some((m) => m.userId === U.A))).toBe(true);
+    expect(b.logs).toEqual([]);
+    expect(b.statuses).toEqual([]);
+    await Promise.all([a.call.close(), b.call.close()]);
+  });
+
+  it('собеседник ушёл и пришёл новый: сессия приёма без треков закрывается, новая создаётся по требованию', async () => {
+    const a = make(U.A);
+    const b = make(U.B);
+    await joinAll(a, b);
+    const oldSub = pcsOf(a).sub!;
+    await b.call.close();
+    await flush(100);
+    expect(oldSub.connectionState).toBe('closed');
+    expect(heard(a, U.B)).toBe(false);
+    const c = make(U.C);
+    await joinAll(c);
+    expect(heard(a, U.C)).toBe(true);
+    expect(pcsOf(a).sub).not.toBe(oldSub);
+    expect(a.logs).toEqual([]);
+    expect(a.statuses).toEqual([]);
+    await Promise.all([a.call.close(), c.call.close()]);
+  });
+
+  it('трек ещё не активен у SFU: подписка повторяется, без пересоздания сессии', async () => {
+    const a = make(U.A);
+    await joinAll(a);
+    sfu.failSubscribes = 2;
+    const b = make(U.B);
+    await joinAll(b);
+    await flush(4000);
+    expect(heard(b, U.A)).toBe(true);
+    expect(b.statuses).toEqual([]);
+    expect(sfu.calls.filter((x) => x.startsWith(`${U.B}:join:`))).toEqual([`${U.B}:join:all`]);
+    await Promise.all([a.call.close(), b.call.close()]);
+  });
+
+  it('демонстрация без микрофона: остановка последнего трека и повторный запуск работают', async () => {
+    const a = make(U.A);
+    const b = make(U.B);
+    const p = a.call.start(async () => ({}));
+    await flush(1600);
+    await p;
+    await joinAll(b);
+    const screen = () => ({ screen: { track: new FakeTrack('video') as unknown as MediaStreamTrack } });
+    await a.call.setSources(screen());
+    await flush(100);
+    expect(heard(b, U.A, 'screen')).toBe(true);
+    await a.call.setSources({ screen: null });
+    await flush(100);
+    expect(heard(b, U.A, 'screen')).toBe(false);
+    await a.call.setSources(screen());
+    await flush(100);
+    expect(heard(b, U.A, 'screen')).toBe(true);
+    expect(a.logs).toEqual([]);
+    expect(b.logs).toEqual([]);
     await Promise.all([a.call.close(), b.call.close()]);
   });
 

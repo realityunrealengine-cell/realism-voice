@@ -9,6 +9,7 @@ interface Entry {
   el: HTMLAudioElement;
   node: MediaStreamAudioSourceNode;
   gain: GainNode;
+  analyser: AnalyserNode;
 }
 
 export type VolumeFn = (userId: string, source: Source) => number;
@@ -33,7 +34,11 @@ export class AudioOut {
     const gain = this.ctx.createGain();
     gain.gain.value = this.volume(userId, source);
     node.connect(gain).connect(this.ctx.destination);
-    this.entries.set(key, { userId, source, el, node, gain });
+    // Уровень до регулятора громкости: индикатор «говорит» не зависит от громкости и «оглушения»
+    const analyser = this.ctx.createAnalyser();
+    analyser.fftSize = 512;
+    node.connect(analyser);
+    this.entries.set(key, { userId, source, el, node, gain, analyser });
   }
 
   remove(key: string) {
@@ -43,10 +48,23 @@ export class AudioOut {
     try {
       e.node.disconnect();
       e.gain.disconnect();
+      e.analyser.disconnect();
     } catch {
       /* ignore */
     }
     e.el.srcObject = null;
+  }
+
+  private buf = new Float32Array(512);
+
+  /** Громкость принятого звука (RMS, 0..1) или null, если такого трека нет */
+  level(key: string): number | null {
+    const e = this.entries.get(key);
+    if (!e) return null;
+    e.analyser.getFloatTimeDomainData(this.buf);
+    let sum = 0;
+    for (let i = 0; i < this.buf.length; i++) sum += this.buf[i] * this.buf[i];
+    return Math.sqrt(sum / this.buf.length);
   }
 
   setVolumes(fn: VolumeFn) {

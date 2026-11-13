@@ -22,6 +22,9 @@ export const defaultPcFactory: PcFactory = (config) => new RTCPeerConnection(con
 export function rtcConfig(iceServers: IceServerLike[] | null | undefined): RTCConfiguration {
   return {
     iceServers: iceServers?.length ? iceServers : [{ urls: 'stun:stun.cloudflare.com:3478' }],
+    // Один транспорт на соединение (как в официальном примере Cloudflare). Соединение никогда не остаётся
+    // без медиалиний (см. SfuCall.setSources / Subscriber.removeStale): иначе Chromium не может создать
+    // предложение, а Cloudflare закрывает сессию — найдено реальной проверкой через Cloudflare.
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
   };
@@ -71,6 +74,16 @@ export function enableOpusDtx(sdp: string): string {
   if (!fm) return sdp;
   if (/usedtx=/.test(fm[1])) return sdp;
   return sdp.replace(re, `a=fmtp:${pt} ${fm[1]};usedtx=1`);
+}
+
+/**
+ * mid первой действующей медиалинии. На ней держится общий транспорт (BUNDLE): если её снять,
+ * Chromium поднимает новый транспорт, о котором Cloudflare не знает, и медиа перестают идти
+ * (найдено реальной проверкой через Cloudflare). Поэтому её никогда не снимают по отдельности.
+ */
+export function bundleTagMid(pc: RTCPeerConnection): string | null {
+  for (const t of pc.getTransceivers()) if (!(t as { stopped?: boolean }).stopped && t.mid !== null && t.currentDirection !== 'stopped') return t.mid;
+  return null;
 }
 
 function waitStable(pc: RTCPeerConnection, timeoutMs = 15_000): Promise<void> {
@@ -180,6 +193,12 @@ export class Publisher {
     if (p) await p.transceiver.sender.replaceTrack(track);
   }
 
+  /** Источник занимает первую медиалинию (её нельзя снять без пересоздания сессии) */
+  holdsBundleTag(source: Source): boolean {
+    const p = this.bySource.get(source);
+    return !!p && bundleTagMid(this.pc) === p.mid;
+  }
+
   sender(source: Source): RTCRtpSender | null {
     return this.bySource.get(source)?.transceiver.sender ?? null;
   }
@@ -199,6 +218,9 @@ export class Publisher {
     return mids;
   }
 }
+
+/** Сколько подряд неудачных запросов подписки терпеть, прежде чем пересоздать сессию приёма */
+export const MAX_SUBSCRIBE_FAILURES = 6;
 
 export interface SubscriberEvents {
   onTrack(ref: RemoteTrackRef, track: MediaStreamTrack, receiver: RTCRtpReceiver): void;
@@ -224,6 +246,9 @@ export class Subscriber {
   private closed = false;
   private retryAt = new Map<string, { at: number; n: number }>();
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private failures = 0;
+  /** Подписки, уже убранные из интерфейса, но ещё удерживающие соединение (см. removeStale) */
+  private readonly hidden = new Set<string>();
   onPcCreated: ((pc: RTCPeerConnection) => void) | null = null;
 
   constructor(
@@ -252,6 +277,7 @@ export class Subscriber {
       if (!ref) return;
       const sub = this.subs.get(ref.name);
       if (sub) sub.transceiver = e.transceiver;
+      if (this.hidden.has(ref.name)) return;
       this.ev.onTrack(ref, e.track, e.receiver);
     });
     this.pcInst = pc;
@@ -286,39 +312,29 @@ export class Subscriber {
 
   private async syncOnce(): Promise<void> {
     const { add, remove } = diffSubscriptions(this.subs.keys(), this.desired);
-    if (remove.length && this.pcInst) {
-      const pc = this.pcInst;
-      await waitStable(pc);
-      const gone = remove.map((n) => this.subs.get(n)!).filter(Boolean);
-      for (const s of gone) {
-        try {
-          s.transceiver?.stop();
-        } catch {
-          /* ignore */
-        }
-        this.subs.delete(s.ref.name);
-        this.byMid.delete(s.mid);
-        this.ev.onTrackGone(s.ref);
-      }
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const res = await this.api.unsubscribe(this.session, pc.localDescription?.sdp ?? offer.sdp ?? '', gone.map((s) => s.mid));
-      if (this.closed) return;
-      await pc.setRemoteDescription({ type: 'answer', sdp: res.sdp });
-    } else {
-      for (const n of remove) this.subs.delete(n);
-    }
-
+    // Ушедшие треки сразу убираются из интерфейса; медиалинии снимаются после новых подписок (см. removeStale)
+    this.hide(remove);
     const now = Date.now();
     const ready = add.filter((a) => (this.retryAt.get(a.name)?.at ?? 0) <= now);
     for (let i = 0; i < ready.length; i += MAX_TRACKS_PER_REQUEST) {
       const batch = ready.slice(i, i + MAX_TRACKS_PER_REQUEST);
       const pc = this.ensurePc();
       await waitStable(pc);
-      const res = await this.api.subscribe(
-        this.session,
-        batch.map((b) => ({ session: b.session, name: b.name })),
-      );
+      let res: Awaited<ReturnType<VoiceApi['subscribe']>>;
+      try {
+        res = await this.api.subscribe(
+          this.session,
+          batch.map((b) => ({ session: b.session, name: b.name })),
+        );
+        this.failures = 0;
+      } catch (e) {
+        // Трек только что опубликован и ещё не активен у SFU (Cloudflare отвечает 404) или временный сбой сети:
+        // повторяем подписку с паузой; сессию приёма пересоздаём только при затяжных ошибках.
+        if (this.closed) return;
+        if (++this.failures > MAX_SUBSCRIBE_FAILURES) throw e;
+        for (const b of batch) this.markRetry(b.name);
+        continue;
+      }
       if (this.closed) return;
       for (const r of res.tracks) {
         const ref = batch.find((b) => b.name === r.name);
@@ -329,8 +345,7 @@ export class Subscriber {
           this.retryAt.delete(ref.name);
         } else {
           // Трек ещё не готов у SFU (публикация только что началась) — повторим с паузой
-          const prev = this.retryAt.get(ref.name)?.n ?? 0;
-          this.retryAt.set(ref.name, { at: Date.now() + Math.min(1000 * 2 ** prev, 8000), n: prev + 1 });
+          this.markRetry(ref.name);
         }
       }
       if (res.renegotiate && res.sdp) {
@@ -341,8 +356,64 @@ export class Subscriber {
         await this.api.answer(this.session, pc.localDescription?.sdp ?? answer.sdp ?? '');
       }
     }
+    await this.removeStale(remove);
     for (const name of this.retryAt.keys()) if (!this.desired.some((d) => d.name === name)) this.retryAt.delete(name);
     this.scheduleRetry();
+  }
+
+  /**
+   * Снятие подписок согласованным закрытием (SDP-предложение клиента → ответ SFU).
+   * Последняя медиалиния не снимается: соединение без медиалиний Cloudflare закрывает, и новые
+   * подписки в эту сессию уже не пройдут. Такой трек скрывается из интерфейса и снимается позже,
+   * когда появится замена; если принимать больше нечего, SfuCall закрывает сессию приёма целиком.
+   */
+  private async removeStale(remove: string[]): Promise<void> {
+    if (!remove.length) return;
+    this.hide(remove);
+    const pc = this.pcInst;
+    if (!pc) {
+      for (const n of remove) {
+        this.subs.delete(n);
+        this.hidden.delete(n);
+      }
+      return;
+    }
+    // Первая медиалиния остаётся (без трафика: её издатель уже не отправляет пакеты)
+    const tag = bundleTagMid(pc);
+    const list = remove.filter((n) => this.subs.get(n)?.mid !== tag);
+    if (!list.length) return;
+    await waitStable(pc);
+    const gone = list.map((n) => this.subs.get(n)).filter((x): x is Subscription => !!x);
+    for (const s of gone) {
+      try {
+        s.transceiver?.stop();
+      } catch {
+        /* ignore */
+      }
+      this.subs.delete(s.ref.name);
+      this.byMid.delete(s.mid);
+      this.hidden.delete(s.ref.name);
+    }
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const res = await this.api.unsubscribe(this.session, pc.localDescription?.sdp ?? offer.sdp ?? '', gone.map((s) => s.mid));
+    if (this.closed) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp: res.sdp });
+  }
+
+  private hide(names: string[]) {
+    for (const n of names) {
+      const s = this.subs.get(n);
+      if (s && !this.hidden.has(n)) {
+        this.hidden.add(n);
+        this.ev.onTrackGone(s.ref);
+      }
+    }
+  }
+
+  private markRetry(name: string) {
+    const prev = this.retryAt.get(name)?.n ?? 0;
+    this.retryAt.set(name, { at: Date.now() + Math.min(500 * 2 ** prev, 8000), n: prev + 1 });
   }
 
   private scheduleRetry() {
@@ -357,7 +428,7 @@ export class Subscriber {
   /** Приёмник звука участника (для индикатора «говорит») */
   receivers(): { ref: RemoteTrackRef; receiver: RTCRtpReceiver }[] {
     const out: { ref: RemoteTrackRef; receiver: RTCRtpReceiver }[] = [];
-    for (const s of this.subs.values()) if (s.transceiver) out.push({ ref: s.ref, receiver: s.transceiver.receiver });
+    for (const s of this.subs.values()) if (s.transceiver && !this.hidden.has(s.ref.name)) out.push({ ref: s.ref, receiver: s.transceiver.receiver });
     return out;
   }
 
@@ -368,7 +439,7 @@ export class Subscriber {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     const mids = [...this.subs.values()].map((s) => s.mid);
-    for (const s of this.subs.values()) this.ev.onTrackGone(s.ref);
+    for (const s of this.subs.values()) if (!this.hidden.has(s.ref.name)) this.ev.onTrackGone(s.ref);
     this.subs.clear();
     this.byMid.clear();
     try {

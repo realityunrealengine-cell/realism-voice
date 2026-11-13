@@ -54,28 +54,40 @@ interface Peer {
   call: SfuCall;
   tracks: Map<string, MediaStreamTrack | null>;
   statuses: string[];
+  speaking: Set<string>;
+  errors: string[];
 }
 
-function participant(user: string): Peer {
-  const p = { tracks: new Map(), statuses: [] } as unknown as Peer;
+function participant(user: string, out?: AudioOut): Peer {
+  const p = { tracks: new Map(), statuses: [], speaking: new Set(), errors: [] } as unknown as Peer;
   const ev: CallEvents = {
     roster: () => undefined,
-    track: (u, s, t) => p.tracks.set(`${u}:${s}`, t),
+    track: (u, s, t) => {
+      p.tracks.set(`${u}:${s}`, t);
+      if (out && (s === 'mic' || s === 'screenAudio')) {
+        if (t) out.add(`${u}:${s}`, u, s, t);
+        else out.remove(`${u}:${s}`);
+      }
+    },
     status: (s, a) => p.statuses.push(`${s}:${a}`),
     lost: () => p.statuses.push('lost'),
     superseded: () => p.statuses.push('superseded'),
-    speaking: () => undefined,
+    speaking: (ids) => (p.speaking = ids),
     quality: () => undefined,
   };
   p.call = new SfuCall({ kind: 'channel', channelId: CH }, user, crypto.randomUUID(), ev, {
     api: api(user),
     rt: new FakeRtClient(server),
+    level: (u) => out?.level(`${u}:mic`) ?? null,
     pcFactory: (cfg) => {
       const pc = new RTCPeerConnection(cfg);
       pcs.push(pc);
       return pc;
     },
-    log: (m) => log(`   · ${user.slice(0, 4)}: ${m}`),
+    log: (m) => {
+      p.errors.push(m);
+      log(`   · ${user.slice(0, 4)}: ${m}`);
+    },
   });
   return p;
 }
@@ -92,6 +104,20 @@ async function until(fn: () => boolean, ms: number): Promise<boolean> {
 
 const subPc = (p: Peer) => (p.call as unknown as { sub: { pc: RTCPeerConnection | null } | null }).sub?.pc ?? null;
 
+/** Идут ли данные: прирост байт за 1 с не меньше min (ждём до ms, пока соединение устанавливается) */
+async function flowing(pc: () => RTCPeerConnection | null, kind: 'audio' | 'video', min: number, ms: number): Promise<number> {
+  const end = Date.now() + ms;
+  let best = 0;
+  while (Date.now() < end) {
+    const a = await inbound(pc(), kind);
+    await sleep(1000);
+    const b = await inbound(pc(), kind);
+    best = Math.max(best, b.bytes - a.bytes);
+    if (best >= min) break;
+  }
+  return best;
+}
+
 async function inbound(pc: RTCPeerConnection | null, kind: 'audio' | 'video') {
   let bytes = 0;
   let frames = 0;
@@ -106,6 +132,19 @@ async function inbound(pc: RTCPeerConnection | null, kind: 'audio' | 'video') {
     }
   });
   return { bytes, frames, level };
+}
+
+async function dump(label: string, pc: RTCPeerConnection | null) {
+  if (!pc) return log(`   ${label}: нет соединения`);
+  log(`   ${label}: ${pc.connectionState}, signaling ${pc.signalingState}`);
+  for (const t of pc.getTransceivers()) log(`     mid ${t.mid} ${t.receiver.track.kind} dir ${t.direction}/${t.currentDirection} stopped ${t.stopped} sendTrack ${t.sender.track?.readyState ?? '-'}`);
+  const st = await pc.getStats();
+  st.forEach((x: any) => {
+    if (x.type === 'inbound-rtp') log(`     in  mid ${x.mid} ${x.kind} ssrc ${x.ssrc} pkts ${x.packetsReceived} bytes ${x.bytesReceived}`);
+    if (x.type === 'outbound-rtp') log(`     out mid ${x.mid} ${x.kind} ssrc ${x.ssrc} pkts ${x.packetsSent} bytes ${x.bytesSent}`);
+  });
+  const sdp = pc.remoteDescription?.sdp ?? '';
+  log(`     remote m-lines: ${sdp.split(/\r?\n/).filter((l) => l.startsWith('m=') || l.startsWith('a=mid') || /^a=(sendonly|recvonly|inactive|sendrecv)/.test(l)).join(' | ')}`);
 }
 
 function tone(freq: number): MediaStreamTrack {
@@ -137,8 +176,12 @@ function screenLike(): MediaStreamTrack {
 
 async function run() {
   log(`Комната ch_${CH.slice(0, 8)}…, участники A и B (Chromium ${navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1]})`);
+  const outCtx = new AudioContext();
+  await outCtx.resume();
+  const out = new AudioOut(outCtx);
+  out.setVolumes(() => 1);
   const a = participant(A);
-  const b = participant(B);
+  const b = participant(B, out);
   const micA = tone(440);
   const micB = tone(660);
 
@@ -152,20 +195,13 @@ async function run() {
   const heard = await until(() => !!a.tracks.get(`${B}:mic`) && !!b.tracks.get(`${A}:mic`), 15_000);
   check('A и B подписались на микрофоны друг друга', heard, `${Math.round(performance.now() - t0)} мс от входа B`);
 
-  const s1 = await inbound(subPc(b), 'audio');
-  await sleep(2500);
-  const s2 = await inbound(subPc(b), 'audio');
-  check('звук A реально приходит к B через SFU', s2.bytes - s1.bytes > 4000, `+${s2.bytes - s1.bytes} байт за 2,5 с, уровень ${s2.level.toFixed(3)}`);
-  const sa = await inbound(subPc(a), 'audio');
-  check('звук B реально приходит к A', sa.bytes > 4000, `${sa.bytes} байт`);
+  const ab = await flowing(() => subPc(b), 'audio', 2000, 10_000);
+  check('звук A реально приходит к B через SFU', ab >= 2000, `${ab} байт/с`);
+  const ba = await flowing(() => subPc(a), 'audio', 2000, 10_000);
+  check('звук B реально приходит к A через SFU', ba >= 2000, `${ba} байт/с`);
 
   // Воспроизведение у B той же цепочкой, что в приложении (Web Audio, громкость участника)
-  const outCtx = new AudioContext();
-  await outCtx.resume();
-  const out = new AudioOut(outCtx);
-  out.setVolumes(() => 1);
-  out.add('a-mic', A, 'mic', b.tracks.get(`${A}:mic`)!);
-  const entry = (out as unknown as { entries: Map<string, { gain: GainNode }> }).entries.get('a-mic')!;
+  const entry = (out as unknown as { entries: Map<string, { gain: GainNode }> }).entries.get(`${A}:mic`)!;
   const an = outCtx.createAnalyser();
   an.fftSize = 2048;
   entry.gain.connect(an);
@@ -179,8 +215,9 @@ async function run() {
   an.getFloatTimeDomainData(buf);
   const rms0 = Math.sqrt(buf.reduce((x, v) => x + v * v, 0) / buf.length);
   check('громкость участника 0 % (или «оглушение») глушит звук', rms0 < 0.002, `RMS ${rms0.toFixed(4)}`);
-  out.clear();
-  void outCtx.close();
+  out.setVolumes(() => 1);
+
+  check('индикатор «говорит»: B видит, что A говорит (по уровню принятого звука)', await until(() => b.speaking.has(A), 5000));
 
   // демонстрация экрана
   await a.call.setSources({ screen: { track: screenLike(), encoding: { maxBitrate: 2_500_000, maxFramerate: 15 } } });
@@ -199,8 +236,14 @@ async function run() {
   await sleep(2000);
   const m2 = await inbound(subPc(b), 'audio');
   check('при выключенном микрофоне соединение живо (служебные пакеты идут)', m2.bytes > m1.bytes, `+${m2.bytes - m1.bytes} байт`);
+  // Долгий mute: Cloudflare удаляет трек, если пакетов нет 30 с — трек должен пережить 35 с тишины
+  log('   · ждём 35 с с выключенным микрофоном…');
+  const micBefore = b.tracks.get(`${A}:mic`);
+  await sleep(35_000);
   micA.enabled = true;
   a.call.setFlags({ muted: false, deafened: false });
+  const un = await flowing(() => subPc(b), 'audio', 2000, 6000);
+  check('после 35 с mute звук A снова идёт к B без переподключения', un >= 2000 && b.tracks.get(`${A}:mic`) === micBefore, `${un} байт/с`);
 
   // восстановление: новая сессия публикации, переопубликование, переподписка у B
   const before = b.tracks.get(`${A}:mic`);
@@ -209,21 +252,42 @@ async function run() {
   const recovered = await until(() => a.statuses.at(-1) === 'connected:0', 20_000);
   const resub = await until(() => !!b.tracks.get(`${A}:mic`) && b.tracks.get(`${A}:mic`) !== before, 15_000);
   check('восстановление после сбоя: новая сессия SFU и переподписка собеседника', recovered && resub, `${Math.round(performance.now() - t0)} мс`);
-  const r1 = await inbound(subPc(b), 'audio');
-  await sleep(2000);
-  const r2 = await inbound(subPc(b), 'audio');
-  check('после восстановления звук A снова идёт к B', r2.bytes > r1.bytes + 3000, `+${r2.bytes - r1.bytes} байт`);
+  const rf = await flowing(() => subPc(b), 'audio', 2000, 10_000);
+  check('после восстановления звук A снова идёт к B', rf >= 2000, `${rf} байт/с`);
+  if (rf < 2000) {
+    await dump('B приём', subPc(b));
+    await dump('A публикация', (a.call as unknown as { pub: { pc: RTCPeerConnection } | null }).pub?.pc ?? null);
+  }
   check('после восстановления демонстрация у B снова есть', await until(() => !!b.tracks.get(`${A}:screen`), 15_000));
+  const vf = await flowing(() => subPc(b), 'video', 5000, 10_000);
+  check('после восстановления кадры демонстрации идут', vf >= 5000, `${vf} байт/с`);
 
   // остановка демонстрации
   await a.call.setSources({ screen: null });
   check('остановка демонстрации убирает видео у B', await until(() => !b.tracks.get(`${A}:screen`), 10_000));
+  await sleep(1000);
+  const ss = await flowing(() => subPc(b), 'audio', 2000, 8000);
+  check('после остановки демонстрации звук A продолжает идти', ss >= 2000, `${ss} байт/с`);
 
   // выход
   await a.call.close();
   check('выход A: B больше не видит и не принимает A', await until(() => b.call.others.length === 0 && !b.tracks.get(`${A}:mic`), 10_000));
+
+  // Собеседник ушёл, пришёл новый: у B новая сессия приёма создаётся по требованию
+  const C = crypto.randomUUID();
+  const micC = tone(550);
+  const c = participant(C);
+  await c.call.start(async () => ({ mic: { track: micC } }));
+  check('новый участник C: B слышит C', await until(() => !!b.tracks.get(`${C}:mic`), 15_000));
+  const cb = await flowing(() => subPc(b), 'audio', 2000, 10_000);
+  check('звук C реально приходит к B', cb >= 2000, `${cb} байт/с`);
+  await c.call.close();
+  micC.stop();
   await b.call.close();
   [micA, micB].forEach((t) => t.stop());
+  out.clear();
+  void outCtx.close();
+  check('ни одной ошибки согласования за всю проверку', a.errors.length === 0 && b.errors.length === 0, [...a.errors, ...b.errors].join('; '));
   check('все RTCPeerConnection закрыты (нет утечек)', pcs.every((pc) => pc.connectionState === 'closed'), `${pcs.length} соединений`);
   window.smoke.done(ok);
 }
