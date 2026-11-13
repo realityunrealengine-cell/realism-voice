@@ -15,11 +15,19 @@ export type VoiceSelfState = Omit<VoiceMember, 'user_id' | 'joined_at'>;
 
 interface PresenceState {
   online: Record<string, OnlineStatus>;
+  /** Свой статус так, как его видят остальные (выбранный, «Неактивен» при отсутствии, «Невидимый»), или null до входа */
+  self: PresenceStatus | null;
+  /** Свой id (для показа своего статуса) */
+  me: string | null;
   voice: Record<string, VoiceMember[]>; // serverId -> участники голосовых каналов
   /** Канал онлайн-статусов подключён (сервер видит этот клиент) */
   connected: boolean;
   start: (userId: string, status: PresenceStatus) => void;
   setStatus: (status: PresenceStatus) => void;
+  /** Пользователь отошёл (бездействие, блокировка экрана) или вернулся */
+  setAway: (away: boolean) => void;
+  /** Компьютер засыпает: сразу пропасть из «В сети»; просыпается — вернуться */
+  setAsleep: (asleep: boolean) => void;
   stop: () => Promise<void>;
   watchVoice: (serverIds: string[]) => void;
   trackVoice: (serverId: string | null, state: VoiceSelfState | null) => void;
@@ -35,6 +43,8 @@ const client = supabase as unknown as RtClient;
 let globalCh: SupervisedChannel | null = null;
 let myId: string | null = null;
 let myStatus: PresenceStatus = 'online';
+let away = false;
+let asleep = false;
 let wantedVoice: string[] = [];
 const voiceChannels = new Map<string, SupervisedChannel>();
 let trackedVoice: { serverId: string; state: VoiceSelfState; joinedAt: number } | null = null;
@@ -45,8 +55,16 @@ const log = (msg: string) => {
 };
 
 export const usePresence = create<PresenceState>((set, get) => {
+  /** Статус, который видят остальные: при «В сети» и отсутствии пользователя — «Неактивен» */
+  const published = (): PresenceStatus => (myStatus === 'online' && away ? 'idle' : myStatus);
+
   const globalPayload = () =>
-    myId && myStatus !== 'invisible' ? { user_id: myId, status: myStatus, at: Date.now() } : null;
+    myId && !asleep && published() !== 'invisible' ? { user_id: myId, status: published(), at: Date.now() } : null;
+
+  const pushSelf = () => {
+    set({ self: myId ? published() : null });
+    globalCh?.setPayload(globalPayload());
+  };
 
   const voicePayload = (serverId: string) =>
     myId && trackedVoice?.serverId === serverId
@@ -85,6 +103,8 @@ export const usePresence = create<PresenceState>((set, get) => {
 
   return {
     online: {},
+    self: null,
+    me: null,
     voice: {},
     connected: false,
 
@@ -92,6 +112,7 @@ export const usePresence = create<PresenceState>((set, get) => {
       if (myId && myId !== userId) void get().stop();
       myId = userId;
       myStatus = status;
+      set({ self: published(), me: userId });
       if (!globalCh) {
         globalCh = new SupervisedChannel({
           client,
@@ -112,7 +133,19 @@ export const usePresence = create<PresenceState>((set, get) => {
     setStatus: (status) => {
       if (status === myStatus) return;
       myStatus = status;
-      globalCh?.setPayload(globalPayload());
+      pushSelf();
+    },
+
+    setAway: (v) => {
+      if (v === away) return;
+      away = v;
+      pushSelf();
+    },
+
+    setAsleep: (v) => {
+      if (v === asleep) return;
+      asleep = v;
+      pushSelf();
     },
 
     stop: async () => {
@@ -123,7 +156,9 @@ export const usePresence = create<PresenceState>((set, get) => {
       voiceChannels.clear();
       trackedVoice = null;
       myId = null;
-      set({ online: {}, voice: {}, connected: false });
+      away = false;
+      asleep = false;
+      set({ online: {}, self: null, me: null, voice: {}, connected: false });
       await Promise.all(all.map((c) => c.stop()));
     },
 
@@ -160,4 +195,19 @@ export const usePresence = create<PresenceState>((set, get) => {
 
 export function effectiveStatus(online: PresenceState['online'], userId: string): PresenceStatus | 'offline' {
   return online[userId] ?? 'offline';
+}
+
+/**
+ * Статус пользователя для показа. Свой статус — тот, что выбран (включая «Невидимый» и автоматический
+ * «Неактивен»), а не «эхо» от сервера: иначе при «Невидимом» или до подключения вы видели себя «Не в сети».
+ */
+export function displayStatus(s: Pick<PresenceState, 'online' | 'self' | 'me'>, userId: string): PresenceStatus | 'offline' {
+  if (s.me && userId === s.me && s.self) return s.self;
+  return s.online[userId] ?? 'offline';
+}
+
+/** Виден ли пользователь «в сети» остальным (свой статус — по выбранному, без ожидания эха сервера) */
+export function visibleOnline(s: Pick<PresenceState, 'online' | 'self' | 'me'>, userId: string): boolean {
+  if (s.me && userId === s.me && s.self) return s.self !== 'invisible';
+  return !!s.online[userId];
 }

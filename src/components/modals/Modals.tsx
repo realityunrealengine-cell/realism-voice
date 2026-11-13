@@ -5,7 +5,7 @@ import { useServers } from '@/stores/servers';
 import { useAuth } from '@/stores/auth';
 import { useSocial, otherUser } from '@/stores/social';
 import { useProfile } from '@/stores/profiles';
-import { usePresence } from '@/stores/presence';
+import { displayStatus, usePresence } from '@/stores/presence';
 import { supabase } from '@/lib/supabase';
 import { errorMessage } from '@/lib/errors';
 import { formatDay, inviteLink, plural } from '@/lib/format';
@@ -430,7 +430,10 @@ function InviteFriendModal({ userId, onClose }: { userId: string; onClose: () =>
 function ProfileModal({ userId, serverId, onClose }: { userId: string; serverId?: string; onClose: () => void }) {
   const p = useProfile(userId);
   const me = useAuth((s) => s.userId);
-  const status = usePresence((s) => s.online[userId]);
+  const status = usePresence((s) => {
+    const st = displayStatus(s, userId);
+    return st === 'offline' ? undefined : st;
+  });
   const member = useServers((s) => (serverId ? s.members[serverId]?.find((m) => m.user_id === userId) : undefined));
   const friendship = useSocial((s) => s.friendships.find((f) => f.requester_id === userId || f.addressee_id === userId));
   const servers = useServers((s) => s.servers);

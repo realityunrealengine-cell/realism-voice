@@ -55,7 +55,7 @@ export interface UpdateState {
   signatureRequired: boolean;
 }
 
-export type PowerEvent = 'suspend' | 'resume' | 'lock-screen' | 'unlock-screen';
+export type PowerEvent = 'suspend' | 'resume' | 'lock-screen' | 'unlock-screen' | 'user-idle' | 'user-active';
 
 // ---------- Диагностика подключения ----------
 

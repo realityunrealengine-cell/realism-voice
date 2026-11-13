@@ -1,7 +1,7 @@
 import { colorFromId, initials } from '@/lib/format';
 import { publicUrl } from '@/lib/supabase';
 import { useProfile } from '@/stores/profiles';
-import { usePresence } from '@/stores/presence';
+import { displayStatus, usePresence } from '@/stores/presence';
 import type { PresenceStatus } from '@/lib/types';
 
 const STATUS_COLOR: Record<PresenceStatus | 'offline', string> = {
@@ -26,7 +26,7 @@ interface AvatarProps {
 
 export function Avatar({ userId, size = 40, showStatus = false, speaking = false, className = '' }: AvatarProps) {
   const profile = useProfile(userId);
-  const status = usePresence((s) => (userId ? s.online[userId] ?? 'offline' : 'offline'));
+  const status = usePresence((s) => (userId ? displayStatus(s, userId) : 'offline'));
   const url = publicUrl('avatars', profile?.avatar_path);
   const name = profile?.display_name ?? '?';
   const dot = Math.max(10, Math.round(size * 0.3));

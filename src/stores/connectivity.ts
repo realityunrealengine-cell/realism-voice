@@ -53,6 +53,15 @@ export const useConnectivity = create<ConnectivityState>((set, get) => ({
     window.addEventListener('offline', onOffline);
     document.addEventListener('visibilitychange', onVisible);
     const offPower = window.rv?.app.onPower?.((ev) => {
+      // Честный статус: заблокирован экран или нет действий 10 минут — «Неактивен»; сон — не в сети
+      const presence = usePresence.getState();
+      if (ev === 'lock-screen' || ev === 'user-idle') presence.setAway(true);
+      if (ev === 'unlock-screen' || ev === 'user-active') presence.setAway(false);
+      if (ev === 'suspend') presence.setAsleep(true);
+      if (ev === 'resume') {
+        presence.setAsleep(false);
+        presence.setAway(false);
+      }
       if (ev === 'resume' || ev === 'unlock-screen') {
         set({ resuming: true });
         void get().recover(ev).finally(() => set({ resuming: false }));

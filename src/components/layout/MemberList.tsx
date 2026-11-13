@@ -2,7 +2,7 @@ import { useEffect, useMemo } from 'react';
 import { Crown, Shield, ShieldCheck } from 'lucide-react';
 import { useServers } from '@/stores/servers';
 import { useProfiles } from '@/stores/profiles';
-import { usePresence } from '@/stores/presence';
+import { usePresence, visibleOnline } from '@/stores/presence';
 import { useUi } from '@/stores/ui';
 import { Avatar } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
@@ -44,6 +44,8 @@ export function MemberList({ serverId }: { serverId: string }) {
   const members = useServers((s) => s.members[serverId]);
   const loaded = useServers((s) => s.membersLoaded[serverId]);
   const online = usePresence((s) => s.online);
+  const self = usePresence((s) => s.self);
+  const me = usePresence((s) => s.me);
   const profiles = useProfiles((s) => s.byId);
 
   useEffect(() => {
@@ -54,8 +56,9 @@ export function MemberList({ serverId }: { serverId: string }) {
     const list = members ?? [];
     const name = (m: Member) => (m.nickname || profiles[m.user_id]?.display_name || '').toLowerCase();
     const sorted = [...list].sort((a, b) => ROLE_RANK[b.role] - ROLE_RANK[a.role] || name(a).localeCompare(name(b)));
-    const on = sorted.filter((m) => online[m.user_id]);
-    const off = sorted.filter((m) => !online[m.user_id]);
+    const isOn = (id: string) => visibleOnline({ online, self, me }, id);
+    const on = sorted.filter((m) => isOn(m.user_id));
+    const off = sorted.filter((m) => !isOn(m.user_id));
     const byRole: { title: string; list: Member[]; offline: boolean }[] = [];
     for (const role of ['owner', 'admin', 'moderator', 'member'] as ServerRole[]) {
       const l = on.filter((m) => m.role === role);
@@ -63,7 +66,7 @@ export function MemberList({ serverId }: { serverId: string }) {
     }
     if (off.length) byRole.push({ title: `Не в сети — ${off.length}`, list: off, offline: true });
     return byRole;
-  }, [members, online, profiles]);
+  }, [members, online, self, me, profiles]);
 
   return (
     <div className="h-full w-[248px] overflow-y-auto px-2 py-4">

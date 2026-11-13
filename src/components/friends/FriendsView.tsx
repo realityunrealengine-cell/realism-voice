@@ -3,7 +3,7 @@ import { Check, MessageSquare, MoreVertical, Search, ShieldOff, UserPlus, Users,
 import { useAuth } from '@/stores/auth';
 import { otherUser, useSocial } from '@/stores/social';
 import { useProfile } from '@/stores/profiles';
-import { usePresence } from '@/stores/presence';
+import { displayStatus, usePresence } from '@/stores/presence';
 import { toast, useUi, type View } from '@/stores/ui';
 import { Avatar } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
@@ -15,7 +15,10 @@ type Tab = Extract<View, { kind: 'home' }>['tab'];
 
 function PersonRow({ userId, subtitle, actions }: { userId: string; subtitle?: string; actions: JSX.Element }) {
   const p = useProfile(userId);
-  const status = usePresence((s) => s.online[userId]);
+  const status = usePresence((s) => {
+    const st = displayStatus(s, userId);
+    return st === 'offline' ? undefined : st;
+  });
   return (
     <div
       className="group flex items-center gap-3 rounded-xl border-t border-white/5 px-3 py-2.5 transition hover:bg-white/5"

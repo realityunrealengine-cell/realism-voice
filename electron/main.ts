@@ -507,7 +507,24 @@ function setupPowerEvents() {
   for (const ev of ['suspend', 'resume', 'lock-screen', 'unlock-screen'] as const) {
     powerMonitor.on(ev as 'suspend', () => mainWindow?.webContents.send('power', ev));
   }
+  // Бездействие: нет ввода с клавиатуры и мыши во всей системе дольше USER_IDLE_SECONDS → статус «Неактивен»
+  let idle = false;
+  setInterval(() => {
+    let seconds = 0;
+    try {
+      seconds = powerMonitor.getSystemIdleTime();
+    } catch {
+      return;
+    }
+    const now = seconds >= USER_IDLE_SECONDS;
+    if (now === idle) return;
+    idle = now;
+    mainWindow?.webContents.send('power', idle ? 'user-idle' : 'user-active');
+  }, 15_000).unref();
 }
+
+/** Через сколько секунд без действий пользователя статус «В сети» сменяется на «Неактивен» */
+const USER_IDLE_SECONDS = 10 * 60;
 
 // ---------- Запуск ----------
 app.whenReady().then(() => {

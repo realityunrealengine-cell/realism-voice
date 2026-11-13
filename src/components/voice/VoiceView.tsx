@@ -94,7 +94,8 @@ function Tile({ p, big, deafened }: { p: ParticipantView; big?: boolean; deafene
         <span className={`rounded-lg bg-black/60 p-1.5 ${q.color}`} title={q.label}>
           <Signal className="h-3.5 w-3.5" />
         </span>
-        {video && (
+        {/* Свою демонстрацию на весь экран не разворачиваем: экран захватывает сам себя («бесконечное зеркало») */}
+        {video && !(p.isLocal && isScreen) && (
           <button className="rounded-lg bg-black/60 p-1.5 text-white" title="На весь экран" onClick={() => void boxRef.current?.requestFullscreen()}>
             <Expand className="h-3.5 w-3.5" />
           </button>

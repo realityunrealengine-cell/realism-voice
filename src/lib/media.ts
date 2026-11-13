@@ -84,9 +84,15 @@ export function publishableKey(): string {
   return SUPABASE_PUBLISHABLE_KEY;
 }
 
-/** Загрузка данных из буфера обмена (небольшие изображения) стандартным способом */
+/**
+ * Загрузка данных без файла на диске (скриншот из буфера обмена, картинка, перетащенная из браузера).
+ * Тело отправляется как есть, а не формой: storage-js упаковывает Blob в multipart, заявленный размер
+ * запроса становится на сотни байт больше зарезервированного, и политика Storage (фактический размер
+ * не больше резерва) отклоняет загрузку — из-за этого скриншоты не отправлялись.
+ */
 export async function uploadBlob(path: string, blob: Blob, contentType: string): Promise<void> {
-  const { error } = await supabase.storage.from('attachments').upload(path, blob, { contentType, upsert: false });
+  const body = new Uint8Array(await blob.arrayBuffer());
+  const { error } = await supabase.storage.from('attachments').upload(path, body, { contentType, upsert: false });
   if (error) throw new Error(error.message);
 }
 
