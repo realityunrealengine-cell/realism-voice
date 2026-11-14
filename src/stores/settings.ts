@@ -35,7 +35,7 @@ export interface Prefs {
     glass: boolean;
   };
   cameraQuality: '480p' | '720p' | '1080p';
-  screenQuality: '720p' | '1080p' | '1080p60';
+  screenQuality: '720p' | '1080p' | '1080p60' | '1440p60';
   screenAudio: boolean;
   showLinkPreviews: boolean;
 }
@@ -71,7 +71,7 @@ export const DEFAULT_PREFS: Prefs = {
     glass: true,
   },
   cameraQuality: '720p',
-  screenQuality: '1080p',
+  screenQuality: '1440p60',
   screenAudio: false,
   showLinkPreviews: true,
 };
@@ -110,7 +110,15 @@ export const useSettings = create<SettingsState>()(
     }),
     {
       name: 'rv-prefs',
-      version: 1,
+      version: 2,
+      // 1.2.3: качество демонстрации по умолчанию — 1440p 60 к/с (прежнее значение по умолчанию заменяется)
+      migrate: (persisted, version) => {
+        const st = (persisted ?? {}) as { prefs?: Partial<Prefs> };
+        if (version < 2 && st.prefs && (st.prefs.screenQuality === undefined || st.prefs.screenQuality === '1080p')) {
+          st.prefs = { ...st.prefs, screenQuality: '1440p60' };
+        }
+        return st as unknown as SettingsState;
+      },
       partialize: (s) => ({ prefs: s.prefs }),
       merge: (persisted, current) => {
         const p = (persisted as { prefs?: Partial<Prefs> })?.prefs ?? {};

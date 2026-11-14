@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { FileText, Folder, FolderUp, FileUp, Plus, Send, ShieldAlert, Smile, X } from 'lucide-react';
+import { FileText, Folder, FolderUp, FileUp, Mic, Plus, Send, ShieldAlert, Smile, X } from 'lucide-react';
+import { formatClock, startRecording, type Recording } from '@/lib/voiceMessage';
 import type { OutgoingItem, Profile, Scope } from '@/lib/types';
 import type { PickedItem } from '../../../electron/shared';
 import { isDangerousFile } from '../../../electron/fileRisk';
@@ -136,6 +137,9 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
   const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
   const [mentionIdx, setMentionIdx] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [recording, setRecording] = useState<Recording | null>(null);
+  const [recSec, setRecSec] = useState(0);
+  const recRef = useRef<Recording | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const me = useAuth((s) => s.userId)!;
@@ -260,7 +264,64 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
     });
   };
 
+  // ---------- голосовые сообщения ----------
+  useEffect(() => {
+    if (!recording) return;
+    const t = setInterval(() => setRecSec((Date.now() - recording.startedAt) / 1000), 250);
+    return () => clearInterval(t);
+  }, [recording]);
+  // Смена чата или закрытие — запись отменяется, микрофон освобождается
+  useEffect(
+    () => () => {
+      recRef.current?.cancel();
+      recRef.current = null;
+      setRecording(null);
+    },
+    [scope.id],
+  );
+
+  const startVoice = async () => {
+    if (recording) return;
+    try {
+      const r = await startRecording();
+      recRef.current = r;
+      setRecSec(0);
+      setRecording(r);
+    } catch (e) {
+      const name = (e as { name?: string })?.name;
+      toast.error(
+        'Микрофон недоступен',
+        name === 'NotAllowedError' ? 'Разрешите доступ к микрофону в настройках Windows → Конфиденциальность.' : (e as Error)?.message || 'Ошибка устройства',
+      );
+    }
+  };
+
+  const finishVoice = async (sendIt: boolean) => {
+    const r = recRef.current;
+    if (!r) return;
+    recRef.current = null;
+    setRecording(null);
+    if (!sendIt) {
+      r.cancel();
+      return;
+    }
+    const file = await r.finish();
+    if (!file) return;
+    if (file.size > maxFile) {
+      toast.error('Голосовое сообщение слишком длинное', tooBigText(file.name, file.size, maxFile));
+      return;
+    }
+    const replyTo = useUi.getState().replyTo[scope.id] ?? null;
+    useUi.getState().setReplyTo(scope.id, null);
+    const item: OutgoingItem = { key: crypto.randomUUID(), name: file.name, size: file.size, kind: 'file', blob: file, mime: 'audio/webm' };
+    await useMessages.getState().send(scope, '', [item], replyTo).catch(() => undefined);
+  };
+
   const send = async () => {
+    if (recording) {
+      await finishVoice(true);
+      return;
+    }
     const content = text;
     if (!content.trim() && files.length === 0) return;
     const replyTo = useUi.getState().replyTo[scope.id] ?? null;
@@ -417,23 +478,31 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
             e.target.value = '';
           }}
         />
-        <textarea
-          ref={ref}
-          value={text}
-          rows={1}
-          maxLength={4000}
-          placeholder={placeholder}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={onKeyDown}
-          onBlur={() => setTimeout(() => setMention(null), 150)}
-          onPaste={(e) => {
-            if (e.clipboardData.files.length) {
-              e.preventDefault();
-              void addDropped(e.clipboardData.files);
-            }
-          }}
-          className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[0.95rem] text-slate-100 outline-none placeholder:text-slate-500"
-        />
+        {recording ? (
+          <div className="flex min-h-[36px] flex-1 items-center gap-2 py-1.5 text-[0.95rem] text-slate-100">
+            <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-rose-500" />
+            <span className="tabular-nums">{formatClock(recSec)}</span>
+            <span className="text-sm text-slate-400">Запись голосового сообщения…</span>
+          </div>
+        ) : (
+          <textarea
+            ref={ref}
+            value={text}
+            rows={1}
+            maxLength={4000}
+            placeholder={placeholder}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={onKeyDown}
+            onBlur={() => setTimeout(() => setMention(null), 150)}
+            onPaste={(e) => {
+              if (e.clipboardData.files.length) {
+                e.preventDefault();
+                void addDropped(e.clipboardData.files);
+              }
+            }}
+            className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-1.5 text-[0.95rem] text-slate-100 outline-none placeholder:text-slate-500"
+          />
+        )}
         {text.length > 3500 && <span className="mb-2 text-xs tabular-nums text-amber-300">{4000 - text.length}</span>}
         <div className="relative">
           <button className="icon-btn mb-0.5" title="Эмодзи" onClick={() => setEmoji(!emoji)}>
@@ -450,9 +519,18 @@ export function Composer({ scope, serverId, placeholder, disabled, onTyping, onS
             />
           )}
         </div>
+        {recording ? (
+          <button className="icon-btn mb-0.5" title="Отменить запись" onClick={() => void finishVoice(false)}>
+            <X className="h-5 w-5" />
+          </button>
+        ) : (
+          <button className="icon-btn mb-0.5" title="Записать голосовое сообщение" disabled={!!disabled} onClick={() => void startVoice()}>
+            <Mic className="h-5 w-5" />
+          </button>
+        )}
         <button
-          className={`icon-btn mb-0.5 ${text.trim() || files.length ? 'accent-bg text-white hover:text-white' : ''}`}
-          title="Отправить (Enter)"
+          className={`icon-btn mb-0.5 ${text.trim() || files.length || recording ? 'accent-bg text-white hover:text-white' : ''}`}
+          title={recording ? 'Отправить голосовое сообщение' : 'Отправить (Enter)'}
           onClick={() => void send()}
         >
           <Send className="h-4 w-4" />

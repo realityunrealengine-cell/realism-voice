@@ -91,6 +91,7 @@ export function ScreenPicker({ onClose }: { onClose: () => void }) {
               value={quality}
               onChange={(v) => useSettings.getState().setPrefs({ screenQuality: v })}
               options={[
+                { value: '1440p60', label: '1440p · 60 кадров' },
                 { value: '720p', label: '720p · 30 кадров' },
                 { value: '1080p', label: '1080p · 15 кадров' },
                 { value: '1080p60', label: '1080p · 30 кадров' },

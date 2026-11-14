@@ -3,7 +3,10 @@ import {
   Loader2, Pause, Play, RotateCw, ShieldAlert, WifiOff, X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { Mic } from 'lucide-react';
+import { formatClock, voiceDuration } from '@/lib/voiceMessage';
+import { useSettings } from '@/stores/settings';
 import { SIGNED_URL_TTL, signedUrl } from '@/lib/media';
 import { formatSize, plural } from '@/lib/format';
 import type { Attachment } from '@/lib/types';
@@ -307,6 +310,41 @@ function VideoAttachment({ a }: { a: Attachment }) {
   return <video src={url} controls autoPlay className="max-h-[320px] max-w-[420px] rounded-xl border border-white/5 bg-black" />;
 }
 
+/** Голосовое сообщение: загружается по нажатию (бережём трафик), играет на выбранном устройстве вывода */
+function VoiceAttachment({ a, duration }: { a: Attachment; duration: number }) {
+  const [requested, setRequested] = useState(false);
+  const { url, failed } = useSigned(a.path, requested, SIGNED_URL_TTL.video);
+  const ref = useRef<HTMLAudioElement>(null);
+  const sink = useSettings((s) => s.prefs.outputDeviceId);
+  useEffect(() => {
+    const el = ref.current as (HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }) | null;
+    if (el?.setSinkId) void el.setSinkId(sink && sink !== 'default' ? sink : '').catch(() => undefined);
+  }, [sink, url]);
+  if (requested && url) {
+    return (
+      <div className="flex w-[320px] max-w-full items-center gap-2 rounded-xl border border-white/5 bg-black/30 px-2 py-1.5">
+        <Mic className="h-4 w-4 shrink-0 text-[color:var(--a2)]" />
+        <audio ref={ref} src={url} controls autoPlay className="h-9 min-w-0 flex-1" />
+      </div>
+    );
+  }
+  return (
+    <button
+      className="flex w-[260px] max-w-full items-center gap-3 rounded-xl border border-white/5 bg-black/30 px-3 py-2 text-left text-slate-200 hover:bg-black/40"
+      onClick={() => setRequested(true)}
+      title="Прослушать"
+    >
+      <span className="accent-bg flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white">
+        {requested && !failed ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+      </span>
+      <span className="min-w-0">
+        <span className="block text-sm font-medium">Голосовое сообщение</span>
+        <span className="block text-xs text-slate-400">{failed ?? `${formatClock(duration)} · ${formatSize(a.size)}`}</span>
+      </span>
+    </button>
+  );
+}
+
 function UploadCard({ a, u }: { a: Attachment; u: UploadView | undefined }) {
   const phase = u?.phase ?? 'queued';
   const Icon = typeIcon({ name: a.name, mime: a.mime, kind: a.kind });
@@ -388,6 +426,8 @@ export function Attachments({ list, pending }: { list: Attachment[]; pending?: b
           <PendingAttachment key={a._uploadId ?? i} a={a} />
         ) : a.kind !== 'folder' && a.mime.startsWith('image/') && a.mime !== 'image/svg+xml' ? (
           <ImageAttachment key={a.path} a={a} />
+        ) : a.kind !== 'folder' && voiceDuration(a) !== null ? (
+          <VoiceAttachment key={a.path} a={a} duration={voiceDuration(a)!} />
         ) : a.kind !== 'folder' && a.mime.startsWith('video/') ? (
           <VideoAttachment key={a.path} a={a} />
         ) : (

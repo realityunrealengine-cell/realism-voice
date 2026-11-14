@@ -141,6 +141,8 @@ function cameraPreset() {
 
 function screenPreset() {
   const q = useSettings.getState().prefs.screenQuality;
+  // 1440p 60 к/с: потолок битрейта с запасом для движущейся картинки; реальный битрейт подстраивается под канал
+  if (q === '1440p60') return { width: 2560, height: 1440, fps: 60, bitrate: 12_000_000 };
   return q === '1080p60'
     ? { width: 1920, height: 1080, fps: 30, bitrate: 5_000_000 }
     : q === '720p'
@@ -596,7 +598,8 @@ export const useVoice = create<VoiceState>((set, get) => {
         screenStream = stream;
         const video = stream.getVideoTracks()[0];
         const audio = stream.getAudioTracks()[0];
-        video.contentHint = 'detail';
+        // 60 к/с — сохраняем плавность (без подсказки 'detail', которая жертвует частотой кадров ради резкости)
+        video.contentHint = preset.fps >= 60 ? 'motion' : 'detail';
         // Окно закрыто или демонстрацию остановила система
         video.addEventListener('ended', () => {
           if (screenStream === stream) void get().stopScreen();
