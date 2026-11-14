@@ -50,6 +50,8 @@ const SPEAKING_LEVEL = 0.01;
 const SPEAKING_HOLD_MS = 400;
 const STATS_MS = 3_000;
 const WATCHDOG_MS = 20_000;
+/** Сколько держать участника, пропавшего из presence, прежде чем считать, что он ушёл */
+export const DEPARTED_GRACE_MS = 4_000;
 
 type Scope = 'pub' | 'sub';
 export type LocalSources = Partial<Record<Source, Omit<PublishItem, 'source'>>>;
@@ -93,6 +95,10 @@ export class SfuCall {
   private synced = false;
   private syncWaiters: (() => void)[] = [];
   private supersededSent = false;
+  private announced = false;
+  private lastSeen: RoomMember[] = [];
+  private departed = new Map<string, { m: RoomMember; at: number }>();
+  private departTimer: ReturnType<typeof setTimeout> | null = null;
   private timers: ReturnType<typeof setInterval>[] = [];
   private discTimers = new Map<RTCPeerConnection, ReturnType<typeof setTimeout>>();
   private pending = new Set<Scope>();
@@ -213,22 +219,52 @@ export class SfuCall {
   }
 
   private pushPresence() {
-    if (!this.closed) this.channel?.setPayload(this.payload() as unknown as Record<string, unknown>);
+    if (this.closed || !this.channel) return;
+    this.announced = true;
+    this.channel.setPayload(this.payload() as unknown as Record<string, unknown>);
   }
 
   private onSync(state: Record<string, Record<string, unknown>[]>) {
     if (this.closed) return;
+    // После кратковременного сбоя Realtime канал пересоздаётся, и первое состояние неполное (в нём нет даже нас).
+    // Раньше это выглядело как «все ушли»: снимались подписки на звук, участники «вылетали» из списка.
+    if (this.announced && !(state[this.userId] ?? []).some((m) => m && m.session === this.session)) return;
     const view = reduceRoom(state, { userId: this.userId, session: this.session, joinedAt: this.joinedAt });
     if (view.superseded && !this.supersededSent) {
       this.supersededSent = true;
       this.ev.superseded();
       return;
     }
-    this.others = view.others;
+    this.lastSeen = view.others;
+    this.applyRoster();
     // Первая «настоящая» синхронизация — когда сервер прислал состояние (в нём есть мы или кто-то ещё)
     if (!this.synced && Object.keys(state).length > 0) {
       this.synced = true;
       for (const w of this.syncWaiters.splice(0)) w();
+    }
+  }
+
+  /**
+   * Состав комнаты с «льготным» периодом: участник, пропавший из presence (у него моргнула сеть или
+   * пересоздался канал), остаётся в списке и на подписке DEPARTED_GRACE_MS — без «вылетов» и щелчков звука.
+   */
+  private applyRoster() {
+    if (this.closed) return;
+    const now = Date.now();
+    const present = new Set(this.lastSeen.map((m) => m.userId));
+    for (const m of this.others) if (!present.has(m.userId) && !this.departed.has(m.userId)) this.departed.set(m.userId, { m, at: now });
+    for (const id of present) this.departed.delete(id);
+    const kept: RoomMember[] = [];
+    for (const [id, d] of this.departed) {
+      if (now - d.at < DEPARTED_GRACE_MS) kept.push(d.m);
+      else this.departed.delete(id);
+    }
+    this.others = [...this.lastSeen, ...kept].sort((a, b) => a.joinedAt - b.joinedAt || a.userId.localeCompare(b.userId));
+    if (kept.length && !this.departTimer) {
+      this.departTimer = setTimeout(() => {
+        this.departTimer = null;
+        this.applyRoster();
+      }, DEPARTED_GRACE_MS);
     }
     this.ev.roster(this.others);
     for (const id of [...this.loudAt.keys()]) if (!this.others.some((o) => o.userId === id)) this.loudAt.delete(id);
@@ -385,7 +421,7 @@ export class SfuCall {
     this.pending.add(scope);
     if (this.recovering) return;
     this.recovering = true;
-    const startedAt = Date.now();
+    let startedAt = Date.now();
     let attempt = 0;
     this.ev.status('reconnecting', 0);
 
@@ -393,8 +429,10 @@ export class SfuCall {
       if (this.closed) return;
       const d = nextReconnect(attempt, startedAt, Date.now(), this.online());
       if (d.action === 'give-up') {
-        this.recovering = false;
-        this.ev.lost();
+        // Не сдаёмся и не выкидываем из звонка: новый круг попыток (пауза до 15 с, без сети — ожидание сети).
+        // Выйти из звонка пользователь может сам в любой момент.
+        startedAt = Date.now();
+        step();
         return;
       }
       if (d.action === 'wait-network') {
@@ -591,6 +629,8 @@ export class SfuCall {
     this.closed = true;
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    if (this.departTimer) clearTimeout(this.departTimer);
+    this.departTimer = null;
     for (const t of this.discTimers.values()) clearTimeout(t);
     this.discTimers.clear();
     if (this.recoverTimer) clearTimeout(this.recoverTimer);
@@ -604,7 +644,7 @@ export class SfuCall {
     const ch = this.channel;
     this.channel = null;
     await Promise.all([
-      ch?.stop(),
+      ch?.stop().then(() => (this.deps.rt as { dispose?: () => void }).dispose?.()),
       this.deps.api
         .close(pub && pubMids.length ? { session: pub.session, mids: pubMids } : null, sub && subMids.length ? { session: sub.session, mids: subMids } : null)
         .catch(() => undefined),

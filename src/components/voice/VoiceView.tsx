@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
-  AlertTriangle, Expand, Headphones, HeadphoneOff, Mic, MicOff, Monitor, MonitorOff, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff, Volume2,
+  AlertTriangle, Expand, Headphones, Shrink, HeadphoneOff, Mic, MicOff, Monitor, MonitorOff, PhoneOff, RefreshCw, Settings, Signal, Video, VideoOff, Volume2,
   MessageSquare, Radio,
 } from 'lucide-react';
 import { useVoice, type ParticipantView } from '@/stores/voice';
@@ -61,12 +61,31 @@ function Tile({ p, big, deafened }: { p: ParticipantView; big?: boolean; deafene
   const profile = useProfile(p.identity);
   const [vol, setVol] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
+  const [fs, setFs] = useState(false);
+  useEffect(() => {
+    const on = () => setFs(!!boxRef.current && document.fullscreenElement === boxRef.current);
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && boxRef.current && document.fullscreenElement === boxRef.current) void document.exitFullscreen().catch(() => undefined);
+    };
+    document.addEventListener('fullscreenchange', on);
+    window.addEventListener('keydown', esc);
+    return () => {
+      document.removeEventListener('fullscreenchange', on);
+      window.removeEventListener('keydown', esc);
+    };
+  }, []);
+  // Кнопка, двойной щелчок и Esc переключают полный экран (раньше кнопка только входила в него, выйти было нельзя)
+  const toggleFs = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void boxRef.current?.requestFullscreen().catch(() => undefined);
+  };
   const video = big && p.screen ? p.screen : p.camera;
   const isScreen = big && !!p.screen;
   const q = QUALITY[p.quality];
   return (
     <div
       ref={boxRef}
+      onDoubleClick={() => video && !(p.isLocal && big && !!p.screen) && toggleFs()}
       onContextMenu={(e) => {
         if (p.isLocal) return;
         e.preventDefault();
@@ -90,14 +109,14 @@ function Tile({ p, big, deafened }: { p: ParticipantView; big?: boolean; deafene
         <UserBadge userId={p.identity} tag={false} />
         {isScreen && <span className="rounded bg-rose-500 px-1 text-[10px] font-bold">LIVE</span>}
       </div>
-      <div className="absolute right-2 top-2 flex gap-1 opacity-0 transition group-hover:opacity-100">
+      <div className={`absolute right-2 top-2 flex gap-1 transition ${fs ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
         <span className={`rounded-lg bg-black/60 p-1.5 ${q.color}`} title={q.label}>
           <Signal className="h-3.5 w-3.5" />
         </span>
         {/* Свою демонстрацию на весь экран не разворачиваем: экран захватывает сам себя («бесконечное зеркало») */}
         {video && !(p.isLocal && isScreen) && (
-          <button className="rounded-lg bg-black/60 p-1.5 text-white" title="На весь экран" onClick={() => void boxRef.current?.requestFullscreen()}>
-            <Expand className="h-3.5 w-3.5" />
+          <button className="rounded-lg bg-black/60 p-1.5 text-white" title={fs ? 'Выйти из полноэкранного режима (Esc)' : 'На весь экран'} onClick={toggleFs}>
+            {fs ? <Shrink className="h-3.5 w-3.5" /> : <Expand className="h-3.5 w-3.5" />}
           </button>
         )}
         {!p.isLocal && (

@@ -140,7 +140,7 @@ describe('комната Cloudflare Realtime SFU', () => {
     await joinAll(a, b, c);
     const cPcs = pcsOf(c);
     await c.call.close();
-    await flush(100);
+    await flush(4500);
     expect(cPcs.pub!.connectionState).toBe('closed');
     expect(cPcs.sub!.connectionState).toBe('closed');
     expect(sfu.activePublished().some((t) => t.user === U.C)).toBe(false);
@@ -224,7 +224,7 @@ describe('комната Cloudflare Realtime SFU', () => {
     await joinAll(a, b);
     const oldSub = pcsOf(a).sub!;
     await b.call.close();
-    await flush(100);
+    await flush(4500);
     expect(oldSub.connectionState).toBe('closed');
     expect(heard(a, U.B)).toBe(false);
     const c = make(U.C);
@@ -302,14 +302,53 @@ describe('комната Cloudflare Realtime SFU', () => {
     await Promise.all([a.call.close(), b.call.close()]);
   });
 
-  it('окончательная потеря: через минуту без успеха — «Соединение потеряно»', async () => {
+  it('долгий сбой (больше минуты) не выкидывает из звонка: попытки продолжаются, связь возвращается сама', async () => {
     const a = make(U.A);
-    await joinAll(a);
+    const b = make(U.B);
+    await joinAll(a, b);
     sfu.failJoins = 1000;
     pcsOf(a).pub!.setConnection('failed');
-    await flush(61_000);
-    expect(a.lost).toBe(1);
-    await a.call.close();
+    await flush(150_000);
+    expect(a.lost).toBe(0);
+    expect(a.statuses.at(-1)).toMatch(/^reconnecting:/);
+    sfu.failJoins = 0;
+    await flush(16_000);
+    await flush(200);
+    expect(a.statuses.at(-1)).toBe('connected:0');
+    expect(heard(b, U.A)).toBe(true);
+    await Promise.all([a.call.close(), b.call.close()]);
+  });
+
+  it('кратковременный сбой Realtime у собеседника: он не «вылетает» из списка и звук не снимается', async () => {
+    const a = make(U.A);
+    const b = make(U.B);
+    await joinAll(a, b);
+    const pulls = sfu.activePulls(U.A);
+    const rosters = a.rosters.length;
+    // У B пересоздаётся канал присутствия: запись пропадает и через 2 с появляется снова
+    const chB = b.rt.channelsByTopic.get(`typing:${CH}`)!;
+    const payload = chB.tracked!;
+    await chB.untrack();
+    await flush(2000);
+    await chB.track(payload);
+    await flush(100);
+    expect(a.rosters.slice(rosters).every((r) => r.some((m) => m.userId === U.B))).toBe(true);
+    expect(sfu.activePulls(U.A)).toEqual(pulls);
+    expect(heard(a, U.B)).toBe(true);
+    await Promise.all([a.call.close(), b.call.close()]);
+  });
+
+  it('свой канал присутствия пересоздан (неполное состояние без нас): подписки не снимаются', async () => {
+    const a = make(U.A);
+    const b = make(U.B);
+    await joinAll(a, b);
+    const chA = a.rt.channelsByTopic.get(`typing:${CH}`)!;
+    const pulls = sfu.activePulls(U.A);
+    await chA.untrack();
+    await flush(10);
+    expect(sfu.activePulls(U.A)).toEqual(pulls);
+    expect(a.call.others.map((o) => o.userId)).toEqual([U.B]);
+    await Promise.all([a.call.close(), b.call.close()]);
   });
 
   it('вход тем же пользователем с другого устройства: старое устройство узнаёт об этом', async () => {
@@ -357,7 +396,7 @@ describe('комната Cloudflare Realtime SFU', () => {
     await flush(1600);
     expect(await caught).toBeInstanceOf(RoomFullError);
     await c.call.close();
-    await flush(10);
+    await flush(4500);
     expect(a.call.others.map((o) => o.userId)).toEqual([U.B]);
     await Promise.all([a.call.close(), b.call.close()]);
   });

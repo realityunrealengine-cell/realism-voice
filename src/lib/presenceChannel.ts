@@ -147,9 +147,18 @@ export class SupervisedChannel {
     this.lastJoinAttempt = this.t.now();
     const ch = this.o.client.channel(this.o.topic, { config: { private: true, presence: { key: this.o.key } } });
     this.ch = ch;
-    ch.on('presence', { event: 'sync' }, () => {
-      if (gen === this.generation) this.o.onSync(ch.presenceState());
-    });
+    try {
+      ch.on('presence', { event: 'sync' }, () => {
+        if (gen === this.generation) this.o.onSync(ch.presenceState());
+      });
+    } catch (e) {
+      // Клиент вернул прежний, ещё не закрытый канал с той же темой — убираем его и пробуем снова
+      this.o.log?.(`${this.o.topic}: stale channel (${(e as Error).message})`);
+      this.ch = null;
+      void this.o.client.removeChannel(ch).catch(() => undefined);
+      this.scheduleRecreate();
+      return;
+    }
     ch.subscribe((status, err) => {
       if (gen !== this.generation || this.stopped) return;
       if (status === 'SUBSCRIBED') {
