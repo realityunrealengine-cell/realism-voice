@@ -1,3 +1,4 @@
+import { invalidateSession, sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import type { Session } from '@supabase/supabase-js';
 import { AUTH_CALLBACK_URL, AUTH_RESET_URL, supabase } from '@/lib/supabase';
@@ -57,7 +58,7 @@ export const useAuth = create<AuthState>((set, get) => ({
         return;
       }
       const prevUser = get().userId;
-      set({ session, userId: session.user.id });
+      set({ session, userId: session.user.id, ...(prevUser !== session.user.id && { profile: null }) });
       if (event === 'SIGNED_IN' && prevUser !== session.user.id && get().status !== 'recovery') {
         // Supabase рекомендует не вызывать API синхронно внутри колбэка
         setTimeout(() => void get().loadProfile(), 0);
@@ -73,9 +74,11 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 
   loadProfile: async () => {
+    const session = sessionSignal();
     const uid = get().userId;
     if (!uid) return;
     const { data, error } = await supabase.from('profiles').select('*').eq('id', uid).maybeSingle();
+    if (session.aborted) return;
     if (error) {
       if (error.code === 'PGRST205' || error.code === '42P01') {
         set({ status: 'dbMissing' });
@@ -196,9 +199,11 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 
   updateProfile: async (patch) => {
+    const session = sessionSignal();
     const uid = get().userId;
     if (!uid) return;
     const { data, error } = await supabase.from('profiles').update(patch).eq('id', uid).select('*').single();
+    if (session.aborted) return;
     if (error) throw new Error(errorMessage(error));
     useProfiles.getState().upsert([data as Profile]);
     set({ profile: data as Profile });
@@ -206,3 +211,7 @@ export const useAuth = create<AuthState>((set, get) => ({
 
   setNotice: (notice) => set({ notice }),
 }));
+
+useAuth.subscribe((state, previous) => {
+  if (state.userId !== previous.userId) invalidateSession();
+});

@@ -169,6 +169,14 @@ describe('синхронизация состава голосового кан�
     return { server, clients, views, supervisors };
   }
 
+  it('после stop игнорирует sync от закрывающегося канала', async () => {
+    const { supervisors, views } = setup();
+    await flush();
+    views[0] = [];
+    await supervisors[0].stop();
+    expect(views[0]).toEqual([]);
+  });
+
   it('все трое видят одинаковый состав из трёх участников', async () => {
     const { views } = setup();
     await flush();
