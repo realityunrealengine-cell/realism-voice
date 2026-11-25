@@ -159,9 +159,9 @@ export async function removeAttachments(paths: string[]): Promise<void> {
 }
 
 /** Удалить собственные брошенные загрузки (отменённые, прерванные, из удалённых сообщений) */
-export async function cleanupStaleUploads(): Promise<number> {
+export async function cleanupStaleUploads(session?: AbortSignal): Promise<number> {
   const { data, error } = await supabase.rpc('my_stale_uploads');
-  if (error || !Array.isArray(data) || data.length === 0) return 0;
+  if (session?.aborted || error || !Array.isArray(data) || data.length === 0) return 0;
   const paths = (data as { path: string }[]).map((r) => r.path).filter(Boolean);
   await removeAttachments(paths).catch(() => undefined);
   usageCache = null;

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { Database, RefreshCw } from 'lucide-react';
 import { configError } from '@/lib/supabase';
@@ -85,7 +85,6 @@ export default function App() {
   useAppearance();
   const status = useAuth((s) => s.status);
   const profile = useAuth((s) => s.profile);
-  const booted = useRef<string | null>(null);
 
   useEffect(() => {
     if (configError) return;
@@ -103,20 +102,29 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (status === 'signedIn' && profile && booted.current !== profile.id) {
-      booted.current = profile.id;
-      void bootstrap().then(() => {
-        if (pendingInvite) {
+    let owner: string | null = null;
+    function sync() {
+      const { userId, profile, status } = useAuth.getState();
+      if (owner && owner !== userId) {
+        owner = null;
+        teardown();
+      }
+      if (owner || !userId || status !== 'signedIn' || profile?.id !== userId) return;
+      owner = userId;
+      void bootstrap().then((ready) => {
+        if (ready && owner === userId && pendingInvite) {
           useUi.getState().openModal({ type: 'joinServer', code: pendingInvite });
           pendingInvite = null;
         }
       });
     }
-    if (status === 'signedOut' && booted.current) {
-      booted.current = null;
-      teardown();
-    }
-  }, [status, profile]);
+    const unsubscribe = useAuth.subscribe(sync);
+    sync();
+    return () => {
+      unsubscribe();
+      if (owner) teardown();
+    };
+  }, []);
 
   let content: JSX.Element;
   if (configError) content = <SetupRequired message={configError} />;
