@@ -47,6 +47,13 @@ let away = false;
 let asleep = false;
 let wantedVoice: string[] = [];
 const voiceChannels = new Map<string, SupervisedChannel>();
+const closing = new Set<Promise<void>>();
+function closeChannel(channel: SupervisedChannel) {
+  const pending = channel.stop();
+  closing.add(pending);
+  void pending.then(() => closing.delete(pending));
+}
+
 let trackedVoice: { serverId: string; state: VoiceSelfState; joinedAt: number } | null = null;
 let watchdog: ReturnType<typeof setInterval> | null = null;
 
@@ -93,7 +100,7 @@ export const usePresence = create<PresenceState>((set, get) => {
     for (const [id, ch] of voiceChannels) {
       if (!wanted.has(id)) {
         voiceChannels.delete(id);
-        void ch.stop();
+        closeChannel(ch);
         const { [id]: _x, ...rest } = get().voice;
         set({ voice: rest });
       }
@@ -154,12 +161,14 @@ export const usePresence = create<PresenceState>((set, get) => {
       const all = [globalCh, ...voiceChannels.values()].filter((c): c is SupervisedChannel => !!c);
       globalCh = null;
       voiceChannels.clear();
+      wantedVoice = [];
       trackedVoice = null;
       myId = null;
       away = false;
       asleep = false;
       set({ online: {}, self: null, me: null, voice: {}, connected: false });
-      await Promise.all(all.map((c) => c.stop()));
+      all.forEach(closeChannel);
+      await Promise.all(closing);
     },
 
     watchVoice: (serverIds) => {

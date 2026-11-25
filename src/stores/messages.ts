@@ -1,3 +1,4 @@
+import { sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
 import { errorMessage } from '@/lib/errors';
@@ -267,10 +268,12 @@ export const useMessages = create<MessagesState>((set, get) => {
     reset: () => set({ byScope: {}, extra: {} }),
 
     load: async (scope) => {
+      const session = sessionSignal();
       const cur = get().byScope[scope.id];
       if (cur?.loading || cur?.loaded) return;
       patchScope(scope.id, { loading: true, error: null });
       const { data, error } = await query(scope);
+      if (session.aborted) return;
       if (error) {
         patchScope(scope.id, { loading: false, error: errorMessage(error) });
         return;
@@ -287,12 +290,14 @@ export const useMessages = create<MessagesState>((set, get) => {
     },
 
     loadOlder: async (scope) => {
+      const session = sessionSignal();
       const cur = get().byScope[scope.id];
       if (!cur || cur.loading || !cur.hasMore) return;
       const oldest = cur.messages.find((m) => !m._status);
       if (!oldest) return;
       patchScope(scope.id, { loading: true });
       const { data, error } = await query(scope).lt('created_at', oldest.created_at);
+      if (session.aborted) return;
       if (error) {
         patchScope(scope.id, { loading: false, error: errorMessage(error) });
         return;
@@ -307,6 +312,7 @@ export const useMessages = create<MessagesState>((set, get) => {
     },
 
     refreshLoaded: async () => {
+      const session = sessionSignal();
       const ids = Object.entries(get().byScope)
         .filter(([, s]) => s.loaded)
         .map(([id]) => id)
@@ -319,7 +325,7 @@ export const useMessages = create<MessagesState>((set, get) => {
             .or(`channel_id.eq.${id},dm_id.eq.${id}`)
             .order('created_at', { ascending: false })
             .limit(PAGE);
-          if (error || !data) return;
+          if (session.aborted || error || !data) return;
           const rows = (data as Message[]).map(normalize).reverse();
           useProfiles.getState().ensure(rows.map((m) => m.author_id));
           patchScope(id, { messages: mergeSorted(get().byScope[id]?.messages ?? [], rows) });
@@ -464,8 +470,10 @@ export const useMessages = create<MessagesState>((set, get) => {
     },
 
     fetchExtra: async (id) => {
+      const session = sessionSignal();
       if (get().extra[id]) return;
       const { data } = await supabase.from('messages').select('*').eq('id', id).maybeSingle();
+      if (session.aborted) return;
       if (data) {
         useProfiles.getState().ensure([(data as Message).author_id]);
         set({ extra: { ...get().extra, [id]: normalize(data as Message) } });

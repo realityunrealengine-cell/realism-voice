@@ -1,3 +1,4 @@
+import { sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
 
@@ -20,11 +21,13 @@ const readTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const unconfirmedReads = new Set<string>();
 const lastMarkedAt = new Map<string, number>();
 
-async function sendMarkRead(scopeId: string, attempt = 0): Promise<void> {
+async function sendMarkRead(scopeId: string, session: AbortSignal, attempt = 0): Promise<void> {
+  if (session.aborted) return;
   // Запросы Supabase ленивые: без await/then запрос не отправляется
   const { error } = await supabase.rpc('mark_read', { p_scope: scopeId });
+  if (session.aborted) return;
   if (error && attempt < 3) {
-    setTimeout(() => void sendMarkRead(scopeId, attempt + 1), 5000);
+    setTimeout(() => void sendMarkRead(scopeId, session, attempt + 1), 5000);
     return;
   }
   if (!readTimers.has(scopeId)) unconfirmedReads.delete(scopeId);
@@ -32,10 +35,18 @@ async function sendMarkRead(scopeId: string, attempt = 0): Promise<void> {
 
 export const useUnread = create<UnreadState>((set, get) => ({
   counts: {},
-  reset: () => set({ counts: {} }),
+  reset: () => {
+    for (const timer of readTimers.values()) clearTimeout(timer);
+    readTimers.clear();
+    unconfirmedReads.clear();
+    lastMarkedAt.clear();
+    set({ counts: {} });
+  },
   load: async () => {
+    const session = sessionSignal();
     const startedAt = Date.now();
     const { data, error } = await supabase.rpc('get_unread_counts');
+    if (session.aborted) return;
     if (error || !data) return;
     const counts: Record<string, Count> = {};
     for (const r of data as { scope_id: string; server_id: string | null; unread: number; mentions: number }[]) {
@@ -49,6 +60,7 @@ export const useUnread = create<UnreadState>((set, get) => ({
     set({ counts: { ...get().counts, [scopeId]: { unread: c.unread + 1, mentions: c.mentions + (mention ? 1 : 0), serverId } } });
   },
   markRead: (scopeId) => {
+    const session = sessionSignal();
     if (get().counts[scopeId]) {
       const { [scopeId]: _x, ...rest } = get().counts;
       set({ counts: rest });
@@ -62,7 +74,7 @@ export const useUnread = create<UnreadState>((set, get) => ({
       scopeId,
       setTimeout(() => {
         readTimers.delete(scopeId);
-        void sendMarkRead(scopeId);
+        void sendMarkRead(scopeId, session);
       }, 600),
     );
   },
