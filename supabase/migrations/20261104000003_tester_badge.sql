@@ -21,7 +21,7 @@ revoke insert, delete on public.profiles from authenticated, anon;
 -- Второй рубеж: даже если когда-нибудь колонка случайно окажется в списке разрешённых,
 -- запрос от имени клиента значок не изменит. SQL Editor и service_role работают под другими ролями.
 create or replace function public.profiles_protect_badge()
-returns trigger language plpgsql as $$
+returns trigger language plpgsql set search_path = '' as $$
 begin
   if current_user in ('authenticated', 'anon') then
     if (tg_op = 'INSERT' and new.badge is not null)

@@ -17,6 +17,7 @@ import { MsgLink, type LinkSignal, type MsgLinkState } from './msgLink';
 import { applyOp, isUuid, messageData, parseFrame, syncPlan } from './ops';
 import { toMessage, type OpKind, type OutboxOp, type P2pStore, type StoredMessage } from './store';
 import type { LinkInfo } from '@/stores/netStats';
+import type { DeviceIdentity, PublicIdentity } from './identity';
 
 export const SIGNAL_EVENT = 'p2p-msg';
 export const ACK_TIMEOUT_MS = 3_000;
@@ -35,6 +36,10 @@ export interface HubEnv {
   onMessage: (m: Message, fresh: boolean) => void;
   onBytes?: (sent: number, received: number) => void;
   onLinks?: (links: Record<string, LinkInfo>) => void;
+  /** Ключ этого устройства */
+  identity: DeviceIdentity;
+  /** Проверка ключа устройства пользователя по списку доверия (false — соединение запрещено) */
+  trust: (userId: string, pub: PublicIdentity) => boolean;
 }
 
 export interface RoomSpec {
@@ -153,6 +158,8 @@ export class P2pHub {
     const entry: LinkEntry = { key, user, dev, state: 'connecting', window: [], link: null as unknown as MsgLink };
     entry.link = new MsgLink({
       initiator,
+      identity: this.env.identity,
+      verifyPeer: (pub) => this.env.trust(user, pub),
       config: { iceServers: this.env.iceServers, bundlePolicy: 'max-bundle' },
       pcFactory: this.env.pcFactory,
       log: this.env.log,
@@ -443,6 +450,19 @@ export class P2pHub {
     }
     this.env.onLinks?.(out);
     return out;
+  }
+
+  /** Список доверия изменился: разорвать соединения с устройствами, которым доверие отозвано */
+  enforceTrust(allowed: (userId: string, pub: PublicIdentity) => boolean) {
+    for (const r of this.rooms.values()) {
+      for (const e of r.links.values()) {
+        const pub = e.link.peerIdentity;
+        if (pub && !allowed(e.user, pub)) {
+          this.log(`hub: trust revoked, closing ${e.key}`);
+          e.link.close(true);
+        }
+      }
+    }
   }
 
   /** Сеть вернулась — пересоздать каналы presence и разорванные соединения без ожидания */

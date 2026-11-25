@@ -12,6 +12,40 @@ import { useSettings } from '@/stores/settings';
 import { usePresence } from '@/stores/presence';
 import { useSocial, dmPeer } from '@/stores/social';
 import { useNetStats } from '@/stores/netStats';
+import { useProfiles } from '@/stores/profiles';
+import { toast } from '@/stores/ui';
+import { deviceIdentity, type DeviceIdentity, type PublicIdentity } from './identity';
+import { localTrustPersistence, TrustStore } from './trust';
+
+let trustSingleton: TrustStore | null = null;
+/** Список доверия к ключам устройств собеседников (и своих других устройств) */
+export function trustStore(): TrustStore {
+  trustSingleton ??= new TrustStore(localTrustPersistence());
+  return trustSingleton;
+}
+
+let identity: DeviceIdentity | null = null;
+/** Ключ этого устройства (после загрузки из защищённого хранилища) */
+export function myIdentity(): DeviceIdentity | null {
+  return identity;
+}
+
+function checkTrust(me: string, userId: string, pub: PublicIdentity): boolean {
+  const t = trustStore();
+  if (!t.allowed(userId, pub)) {
+    log(`untrusted key of ${userId} rejected`);
+    return false;
+  }
+  const seen = t.observe(userId, pub);
+  if (seen === 'new-key') {
+    if (userId === me) toast.info('Новое устройство вашего аккаунта', 'Подключилось по P2P. Если это не вы — отзовите его ключ в «Безопасность → Ключи устройств».');
+    else {
+      const name = useProfiles.getState().byId[userId]?.display_name ?? 'собеседника';
+      toast.info(`Ключ устройства: ${name}`, 'У собеседника новое устройство или сменился ключ. Сверьте код безопасности в «Безопасность → Ключи устройств».');
+    }
+  }
+  return true;
+}
 
 /** Сколько переписок держать на прямой связи одновременно (каждая — отдельное соединение) */
 export const MAX_ROOMS = 12;
@@ -62,7 +96,15 @@ function rooms() {
 function apply() {
   timer = null;
   const me = useAuth.getState().userId;
-  if (!wanted() || !me) {
+  if (!identity && wanted()) {
+    // Ключ устройства ещё загружается из защищённого хранилища
+    void deviceIdentity().then((id) => {
+      identity = id;
+      schedule();
+    });
+    return;
+  }
+  if (!wanted() || !me || !identity) {
     if (hub) {
       void hub.stop();
       hub = null;
@@ -79,6 +121,8 @@ function apply() {
     store: p2pStore(),
     rt: () => voiceRealtime(),
     iceServers: MESSAGE_ICE,
+    identity,
+    trust: (userId, pub) => checkTrust(me, userId, pub),
     log,
     onMessage: (m, fresh) => {
       if (fresh && m.author_id !== me) incoming?.(m);
@@ -114,6 +158,7 @@ export const p2p = {
       useSocial.subscribe((s, prev) => {
         if (s.dms !== prev.dms || s.blocked !== prev.blocked) schedule();
       }),
+      trustStore().subscribe(() => hub?.enforceTrust((user, pub) => trustStore().allowed(user, pub))),
       useSettings.subscribe((s, prev) => {
         if (s.prefs.messageMode !== prev.prefs.messageMode || s.prefs.p2pRelayOnly !== prev.prefs.p2pRelayOnly) schedule();
       }),

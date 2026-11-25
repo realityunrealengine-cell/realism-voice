@@ -7,7 +7,11 @@
 //   * seen     — идентификаторы принятых операций (защита от дублей), хранятся 30 дней.
 // Запись пакетная: изменения копятся в памяти и пишутся одной транзакцией (раз в ~300 мс) —
 // меньше обращений к диску, чем запись каждой операции отдельно.
+// С 1.3.1 сообщения и очередь лежат на диске зашифрованными (AES-256-GCM, ключ под Windows DPAPI, см. vault.ts);
+// открытыми остаются только служебные поля для индексов (id, владелец, переписка). Записи 1.3.0 без шифрования
+// перешифровываются при первом чтении.
 import type { Message } from '@/lib/types';
+import { openJson, sealJson, vaultKey } from './vault';
 
 export type OpKind = 'msg' | 'edit' | 'del' | 'react';
 
@@ -118,17 +122,75 @@ const SEEN_TTL = 30 * 24 * 3600 * 1000;
 
 type Pending = { store: 'messages' | 'outbox' | 'seen'; key: string; value: unknown | null };
 
-/** IndexedDB с пакетной записью */
+interface SealedMessage {
+  id: string;
+  owner: string;
+  dm_id: string;
+  enc?: string;
+}
+
+interface SealedOp {
+  op: string;
+  owner: string;
+  enc?: string;
+}
+
+/** IndexedDB с пакетной записью и шифрованием содержимого */
 export class IdbStore implements P2pStore {
   private db: Promise<IDBDatabase>;
   private pending = new Map<string, Pending>();
+  /** Пишется прямо сейчас (между очисткой очереди и завершением транзакции) */
+  private inflight = new Map<string, Pending>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** Ещё не записанное видно сразу (чтение сначала смотрит сюда) */
   private overlay(store: Pending['store'], key: string): Pending | undefined {
-    return this.pending.get(`${store}:${key}`);
+    return this.pending.get(`${store}:${key}`) ?? this.inflight.get(`${store}:${key}`);
   }
 
-  constructor() {
+  private overlays(store: Pending['store']): Pending[] {
+    return [...this.inflight.values(), ...this.pending.values()].filter((p) => p.store === store);
+  }
+
+  private async wrap(p: Pending): Promise<unknown> {
+    if (p.value === null || p.store === 'seen') return p.value;
+    const k = await this.key();
+    if (p.store === 'messages') {
+      const m = p.value as StoredMessage;
+      return { id: m.id, owner: m.owner, dm_id: m.dm_id, enc: await sealJson(k, m, `m:${m.id}`) } satisfies SealedMessage;
+    }
+    const o = p.value as OutboxOp;
+    return { op: o.op, owner: o.owner, enc: await sealJson(k, o, `o:${o.op}`) } satisfies SealedOp;
+  }
+
+  private async unwrapMsg(r: SealedMessage | StoredMessage | null): Promise<StoredMessage | null> {
+    if (!r) return null;
+    const enc = (r as SealedMessage).enc;
+    if (typeof enc !== 'string') {
+      // Запись 1.3.0 без шифрования — перешифровать
+      if (!this.overlay('messages', r.id)) this.queue({ store: 'messages', key: r.id, value: r });
+      return r as StoredMessage;
+    }
+    try {
+      return await openJson<StoredMessage>(await this.key(), enc, `m:${r.id}`);
+    } catch {
+      return null; // повреждена или подменена
+    }
+  }
+
+  private async unwrapOp(r: SealedOp | OutboxOp): Promise<OutboxOp | null> {
+    const enc = (r as SealedOp).enc;
+    if (typeof enc !== 'string') {
+      if (!this.overlay('outbox', r.op)) this.queue({ store: 'outbox', key: r.op, value: r });
+      return r as OutboxOp;
+    }
+    try {
+      return await openJson<OutboxOp>(await this.key(), enc, `o:${r.op}`);
+    } catch {
+      return null;
+    }
+  }
+
+  constructor(private readonly key: () => Promise<CryptoKey> = vaultKey) {
     this.db = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB, 1);
       req.onupgradeneeded = () => {
@@ -154,20 +216,27 @@ export class IdbStore implements P2pStore {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     if (!this.pending.size) return;
-    const batch = [...this.pending.values()];
+    const batch = [...this.pending.entries()];
     this.pending.clear();
-    const db = await this.db;
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(['messages', 'outbox', 'seen'], 'readwrite');
-      for (const p of batch) {
-        const st = tx.objectStore(p.store);
-        if (p.value === null) st.delete(p.key);
-        else st.put(p.value);
-      }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
+    for (const [k, p] of batch) this.inflight.set(k, p);
+    try {
+      // Шифрование — до открытия транзакции (транзакция IndexedDB не ждёт посторонних await)
+      const rows = await Promise.all(batch.map(async ([, p]) => ({ p, value: await this.wrap(p) })));
+      const db = await this.db;
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(['messages', 'outbox', 'seen'], 'readwrite');
+        for (const { p, value } of rows) {
+          const st = tx.objectStore(p.store);
+          if (value === null) st.delete(p.key);
+          else st.put(value);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      });
+    } finally {
+      for (const [k, p] of batch) if (this.inflight.get(k) === p) this.inflight.delete(k);
+    }
   }
 
   private async getAll<T>(store: string, index: string | null, query: IDBValidKey | IDBKeyRange | null): Promise<T[]> {
@@ -190,10 +259,10 @@ export class IdbStore implements P2pStore {
   }
 
   async messagesFor(owner: string, dm: string, limit = 500): Promise<StoredMessage[]> {
-    const rows = await this.getAll<StoredMessage>('messages', 'owner_dm', [owner, dm]);
+    const sealed = await this.getAll<SealedMessage>('messages', 'owner_dm', [owner, dm]);
+    const rows = (await Promise.all(sealed.map((r) => this.unwrapMsg(r)))).filter((r): r is StoredMessage => !!r);
     const map = new Map(rows.map((r) => [r.id, r]));
-    for (const p of this.pending.values()) {
-      if (p.store !== 'messages') continue;
+    for (const p of this.overlays('messages')) {
       if (p.value === null) map.delete(p.key);
       else if ((p.value as StoredMessage).owner === owner && (p.value as StoredMessage).dm_id === dm) map.set(p.key, p.value as StoredMessage);
     }
@@ -203,7 +272,7 @@ export class IdbStore implements P2pStore {
   async getMessage(id: string) {
     const o = this.overlay('messages', id);
     if (o) return (o.value as StoredMessage | null) ?? null;
-    return this.get<StoredMessage>('messages', id);
+    return this.unwrapMsg(await this.get<SealedMessage>('messages', id));
   }
 
   putMessage(m: StoredMessage) {
@@ -215,10 +284,10 @@ export class IdbStore implements P2pStore {
   }
 
   async outbox(owner: string, dm?: string): Promise<OutboxOp[]> {
-    const rows = await this.getAll<OutboxOp>('outbox', 'owner', owner);
+    const sealed = await this.getAll<SealedOp>('outbox', 'owner', owner);
+    const rows = (await Promise.all(sealed.map((r) => this.unwrapOp(r)))).filter((r): r is OutboxOp => !!r);
     const map = new Map(rows.map((r) => [r.op, r]));
-    for (const p of this.pending.values()) {
-      if (p.store !== 'outbox') continue;
+    for (const p of this.overlays('outbox')) {
       if (p.value === null) map.delete(p.key);
       else if ((p.value as OutboxOp).owner === owner) map.set(p.key, p.value as OutboxOp);
     }

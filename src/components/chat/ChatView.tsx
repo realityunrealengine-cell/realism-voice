@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
-import { AtSign, Hash, Lock, Phone, Users, Video } from 'lucide-react';
+import { AtSign, Hash, Lock, Phone, ShieldCheck, Users, Video } from 'lucide-react';
+import { trustStore } from '@/lib/p2p/integration';
 import type { Scope } from '@/lib/types';
 import { roleAtLeast, ROLE_LABEL } from '@/lib/types';
 import { useMessages } from '@/stores/messages';
@@ -67,6 +68,11 @@ function DmHeader({ dmId }: { dmId: string }) {
       <button className="icon-btn" title="Видеозвонок" onClick={() => void call(true)}>
         <Video className="h-[18px] w-[18px]" />
       </button>
+      {peer && trustStore().keys(peer).length > 0 && (
+        <button className="icon-btn" title="Код безопасности P2P" onClick={() => useUi.getState().openSettings('security')}>
+          <ShieldCheck className="h-[18px] w-[18px]" />
+        </button>
+      )}
       {peer && (
         <button className="icon-btn" title="Профиль" onClick={() => useUi.getState().openModal({ type: 'profile', userId: peer })}>
           <AtSign className="h-[18px] w-[18px]" />

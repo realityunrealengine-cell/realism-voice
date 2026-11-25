@@ -1,6 +1,9 @@
 // «Безопасность»: двухфакторная аутентификация (TOTP), резервные коды, активные сессии и устройства.
-import { useCallback, useEffect, useState } from 'react';
-import { Copy, Download, KeyRound, LogOut, MonitorSmartphone, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { BadgeCheck, Ban, Copy, Download, Fingerprint, KeyRound, LogOut, MonitorSmartphone, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react';
+import { trustStore } from '@/lib/p2p/integration';
+import { deviceIdentity, fingerprint, publicOf, safetyCode, type PublicIdentity } from '@/lib/p2p/identity';
+import { useProfile } from '@/stores/profiles';
 import { supabase } from '@/lib/supabase';
 import { AttemptLimiter, security, ServerFeatureMissing, type SessionRow, type TotpEnrollment } from '@/lib/security';
 import { useAuth } from '@/stores/auth';
@@ -325,12 +328,100 @@ function Sessions() {
   );
 }
 
+const fmtFp = (fp: string) => fp.slice(0, 32).match(/.{4}/g)!.join(' ').toUpperCase();
+
+function useTrustVersion(): number {
+  return useSyncExternalStore(
+    (cb) => trustStore().subscribe(cb),
+    () => trustStore().version,
+  );
+}
+
+function ContactKeys({ userId, me, myPub }: { userId: string; me: string; myPub: PublicIdentity | null }) {
+  const profile = useProfile(userId);
+  useTrustVersion();
+  const keys = trustStore().keys(userId);
+  const own = userId === me;
+  return (
+    <div className="border-t border-white/5 py-3">
+      <div className="mb-2 text-sm font-medium text-slate-200">{own ? 'Мои другие устройства' : (profile?.display_name ?? userId.slice(0, 8))}</div>
+      {keys.map((k) => (
+        <div key={k.fp} className={`mb-2 rounded-xl bg-black/25 p-3 text-sm ${k.revoked ? 'opacity-60' : ''}`}>
+          <div className="flex items-center gap-2">
+            <Fingerprint className="h-4 w-4 shrink-0 text-slate-400" />
+            <span className="selectable font-mono text-xs text-slate-300">{fmtFp(k.fp)}</span>
+            {k.verified && <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">ПРОВЕРЕНО</span>}
+            {k.revoked && <span className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-rose-300">ОТОЗВАН</span>}
+            <div className="flex-1" />
+            <span className="text-xs text-slate-500">с {new Date(k.firstSeen).toLocaleDateString('ru-RU')}</span>
+          </div>
+          {!own && myPub && k.pub && !k.revoked && (
+            <div className="mt-2">
+              <div className="text-xs text-slate-400">Код безопасности — сверьте его с собеседником (лично или по звонку):</div>
+              <div className="selectable mt-1 font-mono text-sm tracking-wider text-white">{safetyCode({ userId: me, pub: myPub }, { userId, pub: k.pub })}</div>
+            </div>
+          )}
+          <div className="mt-2 flex gap-2">
+            {!k.revoked && (
+              <button className="btn-ghost py-1 text-xs" onClick={() => trustStore().setVerified(userId, k.fp, !k.verified)}>
+                <BadgeCheck className="h-3.5 w-3.5" /> {k.verified ? 'Снять отметку' : 'Код совпадает'}
+              </button>
+            )}
+            <button
+              className={`btn-ghost py-1 text-xs ${k.revoked ? '' : 'text-rose-300'}`}
+              onClick={() => {
+                trustStore().setRevoked(userId, k.fp, !k.revoked);
+                toast.info(k.revoked ? 'Доверие восстановлено' : 'Доверие отозвано', k.revoked ? undefined : 'P2P-соединение с этим устройством больше не устанавливается');
+              }}
+            >
+              <Ban className="h-3.5 w-3.5" /> {k.revoked ? 'Вернуть доверие' : 'Отозвать доверие'}
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DeviceKeys() {
+  const me = useAuth((s) => s.userId);
+  const [myPub, setMyPub] = useState<PublicIdentity | null>(null);
+  useTrustVersion();
+  useEffect(() => {
+    void deviceIdentity()
+      .then((id) => setMyPub(publicOf(id)))
+      .catch(() => setMyPub(null));
+  }, []);
+  if (!me) return null;
+  const users = trustStore().users().sort((a, b) => (a === me ? -1 : b === me ? 1 : 0));
+  return (
+    <Card>
+      <h3 className="font-semibold text-white">Ключи устройств (P2P)</h3>
+      <p className="mt-1 text-sm text-slate-400">
+        Прямые сообщения подписываются ключом устройства (Ed25519 + ML-DSA-65). Ключ собеседника запоминается при первой встрече; если он изменится, вы получите
+        предупреждение. Совпадение кода безопасности у вас и собеседника означает, что между вами нет посредника.
+      </p>
+      <div className="mt-3 rounded-xl bg-black/25 px-3 py-2 text-sm">
+        <span className="text-slate-400">Ключ этого устройства: </span>
+        <span className="selectable font-mono text-xs text-slate-200">{myPub ? fmtFp(fingerprint(myPub)) : '…'}</span>
+      </div>
+      {users.length === 0 && <p className="mt-3 text-sm text-slate-500">Пока нет P2P-соединений — ключи собеседников появятся после первой прямой связи.</p>}
+      <div className="mt-2">
+        {users.map((u) => (
+          <ContactKeys key={u} userId={u} me={me} myPub={myPub} />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
 export function SecuritySection() {
   const email = useAuth((s) => s.session?.user.email);
   return (
     <div className="space-y-6">
       <TwoFactor />
       <Sessions />
+      <DeviceKeys />
       <p className="text-xs text-slate-500">
         Аккаунт: {email}. Защита от перебора: сервер Supabase Auth ограничивает частоту проверок кодов, резервные коды — не более 5 неверных попыток за 15
         минут, в приложении — нарастающая пауза после 5 ошибок.

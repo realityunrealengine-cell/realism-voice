@@ -6,9 +6,14 @@
 //   3. После открытия DataChannel — гибридный обмен ключами X-Wing (X25519 + ML-KEM-768), см. crypto.ts.
 //      До его завершения прикладные данные не передаются. Ключ меняется каждые REKEY_MS / REKEY_FRAMES.
 //   4. Прикладные кадры: AES-256-GCM, счётчик против повтора, выравнивание длины.
+//   5. Подлинность (1.3.1): инициатор подписывает свой эфемерный ключ, ответчик — весь transcript, ключом
+//      устройства Ed25519 + ML-DSA-65. Неподписанный или чужой обмен отклоняется; ключ собеседника
+//      проверяется по списку доверия (verifyPeer) и не может смениться внутри одного соединения.
 import {
-  answerHandshake, dtlsFingerprint, finishHandshake, fromB64, ReplayError, SecureSession, startHandshake, toB64, type HandshakeInit,
+  answerHandshake, dtlsFingerprint, finishHandshake, fromB64, initSigningPayload, replySigningPayload, ReplayError, SecureSession, startHandshake, toB64,
+  type HandshakeInit,
 } from './crypto';
+import { decodePublic, decodeSig, encodePublic, encodeSig, fingerprint, publicOf, signHybrid, verifyHybrid, type DeviceIdentity, type PublicIdentity } from './identity';
 import { linkSnapshot, type LinkSnapshot } from './linkStats';
 
 export interface LinkSignal {
@@ -33,11 +38,17 @@ export interface MsgLinkOptions {
   pcFactory?: (c: RTCConfiguration) => RTCPeerConnection;
   log?: (m: string) => void;
   connectTimeoutMs?: number;
+  /** Ключ этого устройства (подпись обмена ключами) */
+  identity: DeviceIdentity;
+  /** Разрешено ли соединение с устройством с таким ключом (список доверия) */
+  verifyPeer: (pub: PublicIdentity) => boolean;
 }
 
 export const REKEY_MS = 30 * 60_000;
 export const REKEY_FRAMES = 5_000;
 const MAX_FRAME = 64 * 1024;
+/** Сообщения обмена ключами с подписями ML-DSA-65 занимают около 9 КБ */
+const MAX_HANDSHAKE = 24 * 1024;
 
 export class MsgLink {
   readonly pc: RTCPeerConnection;
@@ -53,6 +64,7 @@ export class MsgLink {
   private rxQueue: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private rekeyTimer: ReturnType<typeof setInterval> | null = null;
+  private peer: PublicIdentity | null = null;
 
   constructor(private readonly o: MsgLinkOptions) {
     this.pc = (o.pcFactory ?? ((c) => new RTCPeerConnection(c)))(o.config);
@@ -98,6 +110,31 @@ export class MsgLink {
 
   get keyId(): string | null {
     return this.session?.keyId ?? null;
+  }
+
+  /** Подтверждённый подписью ключ устройства собеседника */
+  get peerIdentity(): PublicIdentity | null {
+    return this.peer;
+  }
+
+  /** Подпись проверена; ключ тот же, что раньше в этом соединении, и разрешён списком доверия */
+  private acceptPeer(pubRaw: unknown, sigRaw: unknown, payload: Uint8Array): boolean {
+    const pub = decodePublic(pubRaw);
+    const sig = decodeSig(sigRaw);
+    if (!pub || !sig || !verifyHybrid(pub, payload, sig)) {
+      this.fail('handshake signature invalid');
+      return false;
+    }
+    if (this.peer && fingerprint(this.peer) !== fingerprint(pub)) {
+      this.fail('peer identity changed inside connection');
+      return false;
+    }
+    if (!this.o.verifyPeer(pub)) {
+      this.fail('peer identity not trusted');
+      return false;
+    }
+    this.peer = pub;
+    return true;
   }
 
   private setState(s: MsgLinkState) {
@@ -178,7 +215,9 @@ export class MsgLink {
   private beginHandshake(epoch: number) {
     const { init, secretKey } = startHandshake();
     this.pendingInit = { init, secretKey, epoch };
-    this.sendPlain({ hs: 1, epoch, pk: toB64(init.pk), nonce: toB64(init.nonce) });
+    const [fpI, fpR] = this.fingerprints();
+    const sig = signHybrid(this.o.identity, initSigningPayload(epoch, fpI, fpR, init));
+    this.sendPlain({ hs: 1, epoch, pk: toB64(init.pk), nonce: toB64(init.nonce), id: encodePublic(publicOf(this.o.identity)), sig: encodeSig(sig) });
   }
 
   private sendPlain(obj: Record<string, unknown>) {
@@ -199,21 +238,24 @@ export class MsgLink {
     if (this.closed) return;
     if (typeof data === 'string') {
       this.o.onBytes?.(0, data.length);
-      if (data.length > 8192) return;
-      const m = JSON.parse(data) as { hs?: number; epoch?: number; pk?: string; ct?: string; nonce?: string };
+      if (data.length > MAX_HANDSHAKE) return;
+      const m = JSON.parse(data) as { hs?: number; epoch?: number; pk?: string; ct?: string; nonce?: string; id?: unknown; sig?: unknown };
       const epoch = typeof m.epoch === 'number' && Number.isInteger(m.epoch) && m.epoch > 0 && m.epoch < 1e6 ? m.epoch : 0;
       if (!epoch) return;
       const [fpI, fpR] = this.fingerprints();
       if (m.hs === 1 && !this.o.initiator && typeof m.pk === 'string' && typeof m.nonce === 'string') {
         if (this.session && epoch <= this.session.epoch) return;
         const init = { pk: fromB64(m.pk), nonce: fromB64(m.nonce) };
+        if (!this.acceptPeer(m.id, m.sig, initSigningPayload(epoch, fpI, fpR, init))) return;
         const { reply, keys } = await answerHandshake(init, epoch, fpI, fpR);
-        this.sendPlain({ hs: 2, epoch, ct: toB64(reply.ct), nonce: toB64(reply.nonce) });
+        const sig = signHybrid(this.o.identity, replySigningPayload(keys.transcript));
+        this.sendPlain({ hs: 2, epoch, ct: toB64(reply.ct), nonce: toB64(reply.nonce), id: encodePublic(publicOf(this.o.identity)), sig: encodeSig(sig) });
         this.installKeys(keys);
       } else if (m.hs === 2 && this.o.initiator && this.pendingInit && epoch === this.pendingInit.epoch && typeof m.ct === 'string' && typeof m.nonce === 'string') {
         const p = this.pendingInit;
         this.pendingInit = null;
         const keys = await finishHandshake(p.init, p.secretKey, { ct: fromB64(m.ct), nonce: fromB64(m.nonce) }, epoch, fpI, fpR);
+        if (!this.acceptPeer(m.id, m.sig, replySigningPayload(keys.transcript))) return;
         this.installKeys(keys);
       }
       return;

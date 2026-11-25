@@ -4,6 +4,8 @@ import { AudioOut } from '@/lib/sfu/audioOut';
 import type { JoinTarget, SessionGrant, VoiceApi } from '@/lib/sfu/api';
 import { P2pHub } from '@/lib/p2p/hub';
 import { MemoryStore } from '@/lib/p2p/store';
+import { fingerprint, newIdentity, type DeviceIdentity } from '@/lib/p2p/identity';
+import { TrustStore, type KnownKey } from '@/lib/p2p/trust';
 import type { Message } from '@/lib/types';
 import { FakeChannel, FakeRealtimeServer, FakeRtClient } from '../../tests/helpers/fakeSfu';
 
@@ -214,10 +216,26 @@ async function oldClient() {
 }
 
 // ---------- сообщения ----------
-function hub(me: string, store: MemoryStore, rec: Message[], bytes: { n: number }) {
+/** Ключ и список доверия «устройства» (сохраняются между перезапусками, как в приложении) */
+interface Device {
+  identity: DeviceIdentity;
+  trust: TrustStore;
+}
+function device(): Device {
+  let saved: Record<string, KnownKey[]> = {};
+  return { identity: newIdentity().id, trust: new TrustStore({ load: () => saved, save: (v) => (saved = JSON.parse(JSON.stringify(v))) }) };
+}
+
+function hub(me: string, store: MemoryStore, rec: Message[], bytes: { n: number }, dev: Device = device()) {
   return new P2pHub({
     me,
     store,
+    identity: dev.identity,
+    trust: (user, pub) => {
+      if (!dev.trust.allowed(user, pub)) return false;
+      dev.trust.observe(user, pub);
+      return true;
+    },
     rt: () => new FakeRtClient(server),
     iceServers: STUN,
     log: (m) => {
@@ -238,8 +256,10 @@ async function messages() {
   const rA: Message[] = [];
   const rB: Message[] = [];
   const bytes = { n: 0 };
-  const hA = hub(A, sA, rA, bytes);
-  let hB = hub(B, sB, rB, bytes);
+  const devA = device();
+  const devB = device();
+  const hA = hub(A, sA, rA, bytes, devA);
+  let hB = hub(B, sB, rB, bytes, devB);
   check('в режиме Auto без канала — сразу на сервер', (await hA.sendMessage(dm, B, { id: uuid(), content: 'x', reply_to_id: null, created_at: new Date().toISOString() }, 3000)) === 'fallback');
   hA.setRooms([{ dm, peer: B }]);
   hB.setRooms([{ dm, peer: A }]);
@@ -264,7 +284,7 @@ async function messages() {
   await sleep(1500);
   log('   получатель снова запускает приложение');
   const before = rB.length;
-  hB = hub(B, sB, rB, bytes);
+  hB = hub(B, sB, rB, bytes, devB);
   hB.setRooms([{ dm, peer: A }]);
   check('после переподключения очередь доставлена', await until(() => !!sB.msgs.get(id2), 30000));
   check('очередь отправителя пуста, отмечено «доставлено»', await until(() => sA.ops.size === 0 && sA.msgs.get(id2)?.delivered === true, 5000));
@@ -283,7 +303,37 @@ async function messages() {
   const id3 = uuid();
   check('после смены ключа сообщения доставляются', (await hA.sendMessage(dm, B, { id: id3, content: 'новый ключ', reply_to_id: null, created_at: new Date().toISOString() }, 3000)) === 'p2p');
   check('байты P2P-сообщений измерены', bytes.n > 0, `${bytes.n} Б`);
-  await Promise.all([hA.stop(), hB.stop(), hA2.stop()]);
+  check('ключ собеседника запомнен (подпись Ed25519 + ML-DSA-65 проверена)', devA.trust.keys(B).length === 1 && devA.trust.keys(B)[0].fp === fingerprint({ ed: devB.identity.edPublic, pq: devB.identity.pqPublic }));
+  check('второе устройство своего аккаунта видно как отдельный ключ', devA.trust.keys(A).length === 1);
+
+  log('   отзыв доверия к ключу собеседника');
+  await Promise.all([hA2.stop(), hB.stop()]);
+  devA.trust.setRevoked(B, devA.trust.keys(B)[0].fp, true);
+  hB = hub(B, sB, rB, bytes, devB);
+  hB.setRooms([{ dm, peer: A }]);
+  await sleep(8000);
+  check('с отозванным ключом защищённый канал не устанавливается', !hA.reachable(dm));
+  devA.trust.setRevoked(B, devA.trust.keys(B)[0].fp, false);
+
+  log('   подмена ключа (посредник с чужим ключом под видом собеседника)');
+  await hB.stop();
+  const mitm = device();
+  devA.trust.setRevoked(B, devA.trust.keys(B)[0].fp, false);
+  const toasts: string[] = [];
+  const hM = new P2pHub({
+    me: B, store: new MemoryStore(), rt: () => new FakeRtClient(server), iceServers: STUN, identity: mitm.identity,
+    trust: () => true, onMessage: () => undefined,
+  });
+  // Сторона A с предупреждением о новом ключе, как в приложении
+  (hA as any).env.trust = (user: string, pub: any) => {
+    if (!devA.trust.allowed(user, pub)) return false;
+    if (devA.trust.observe(user, pub) === 'new-key') toasts.push(user);
+    return true;
+  };
+  hM.setRooms([{ dm, peer: A }]);
+  await until(() => hA.reachable(dm), 20000);
+  check('смена ключа собеседника замечена и вызывает предупреждение', toasts.includes(B) && devA.trust.keys(B).length === 2 && devA.trust.keys(B).every((k) => !k.verified));
+  await Promise.all([hA.stop(), hM.stop()]);
 }
 
 (async () => {

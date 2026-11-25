@@ -16,9 +16,8 @@
 //     в другое соединение;
 //   * меньше метаданных: длина открытого текста выравнивается до 256 байт.
 //
-// Ограничение (честно): подлинность собеседника подтверждает сервер сигнализации (Supabase Realtime
-// с проверкой прав). Проверка долговременных ключей устройств (ML-DSA/Ed25519, «коды безопасности»)
-// — следующий этап; без неё активная подмена на сервере сигнализации теоретически возможна.
+// Подлинность: с 1.3.1 обе стороны подписывают обмен долговременным ключом устройства (Ed25519 + ML-DSA-65,
+// см. identity.ts и msgLink.ts); собеседник проверяется по списку доверия и коду безопасности.
 import { ml_kem768_x25519 } from '@noble/post-quantum/hybrid.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
@@ -77,6 +76,8 @@ export interface EpochKeys {
   recv: CryptoKey;
   /** Хэш transcript — для отображения и проверки совпадения ключей в тестах */
   id: string;
+  /** Полный хэш transcript: его подписывает ключ устройства ответчика */
+  transcript: Uint8Array;
 }
 
 async function importKey(raw: Uint8Array): Promise<CryptoKey> {
@@ -96,12 +97,23 @@ async function deriveKeys(ss: Uint8Array, th: Uint8Array, epoch: number, isOffer
     send: await importKey(isOfferer ? o2a : a2o),
     recv: await importKey(isOfferer ? a2o : o2a),
     id: toB64(th).slice(0, 16),
+    transcript: th,
   };
   okm.fill(0);
   return keys;
 }
 
 /** Инициатор (сторона, сделавшая SDP offer): эфемерная пара ключей X-Wing */
+/** Что подписывает инициатор: свой эфемерный ключ, привязанный к эпохе и обоим отпечаткам DTLS */
+export function initSigningPayload(epoch: number, fpOfferer: string, fpAnswerer: string, init: HandshakeInit): Uint8Array {
+  return sha256(concat(enc.encode(`${LABEL}|hs1|${epoch}|${fpOfferer}|${fpAnswerer}|`), init.pk, init.nonce));
+}
+
+/** Что подписывает ответчик: весь transcript обмена */
+export function replySigningPayload(transcript: Uint8Array): Uint8Array {
+  return sha256(concat(enc.encode(`${LABEL}|hs2|`), transcript));
+}
+
 export function startHandshake(): { init: HandshakeInit; secretKey: Uint8Array } {
   const { publicKey, secretKey } = kem.keygen();
   return { init: { pk: publicKey, nonce: crypto.getRandomValues(new Uint8Array(32)) }, secretKey };

@@ -483,5 +483,26 @@ await expectErr('clients cannot write recovery attempts', () => as(B, `insert in
 await db.exec(`delete from auth.mfa_factors`);
 eq('2FA disabled again: aal1 reads profile', (await asAal(B, 'aal1', 'select id from public.profiles where id=$1', [B])).rows.length, 1);
 
+// ---------- 0011: утечки через вспомогательные функции закрыты ----------
+console.log('\nprivacy hardening (0011)');
+await db.exec(`insert into public.friendships (requester_id, addressee_id, status) values ('${D}', '${E}', 'accepted') on conflict do nothing`);
+eq('outsider cannot learn foreign friendship', (await as(C, `select public.are_friends($1, $2) v`, [D, E])).rows[0].v, false);
+eq('participant sees own friendship', (await as(D, `select public.are_friends($1, $2) v`, [D, E])).rows[0].v, true);
+eq('outsider cannot learn foreign block', (await as(C, `select public.is_blocked_between($1, $2) v`, [A, B])).rows[0].v, false);
+eq('blocked user sees own block', (await as(A, `select public.is_blocked_between($1, $2) v`, [A, B])).rows[0].v, true);
+eq('outsider cannot learn server membership', (await as(C, `select public.member_role($1, $2) r`, [srv, A])).rows[0].r, null);
+await db.exec(`insert into public.server_members (server_id, user_id, role) values ('${srv}', '${E}', 'member') on conflict do nothing`);
+eq('server member sees roles', (await as(E, `select public.member_role($1, $2) r`, [srv, A])).rows[0].r, 'owner');
+eq('own role without server param user', (await as(A, `select public.member_role($1) r`, [srv])).rows[0].r, 'owner');
+eq('outsider cannot probe members via mentions', (await as(C, `select public.extract_mentions('@alice @bob', $1, null) m`, [srv])).rows[0].m, []);
+const aliceName = (await db.query('select username from public.profiles where id=$1', [A])).rows[0].username;
+eq('member mention lookup still works', (await as(E, `select public.extract_mentions($2, $1, null) m`, [srv, '@' + aliceName])).rows[0].m, [A]);
+eq('outsider cannot probe dm via mentions', (await as(C, `select public.extract_mentions('@alice @bob', null, $1) m`, [dm])).rows[0].m, []);
+await db.exec(`select set_config('request.jwt.claim.sub', '', false)`);
+eq('admin context unrestricted', (await db.query(`select public.are_friends($1, $2) v`, [D, E])).rows[0].v, true);
+await expectErr('anon cannot list sessions', () => as(null, 'select * from public.my_sessions()'));
+await expectErr('anon cannot revoke sessions', () => as(null, `select public.revoke_session('00000000-0000-4000-8000-0000000000e1')`));
+eq('badge trigger has fixed search_path', (await db.query(`select proconfig from pg_proc where proname='profiles_protect_badge'`)).rows[0].proconfig, ['search_path=""']);
+
 console.log(failures ? `\n${failures} FAILURES` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);
