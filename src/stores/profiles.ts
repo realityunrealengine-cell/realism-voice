@@ -1,8 +1,10 @@
+import { sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
 import type { Profile } from '@/lib/types';
 
 interface ProfilesState {
+  reset: () => void;
   byId: Record<string, Profile>;
   upsert: (profiles: Profile[]) => void;
   ensure: (ids: (string | null | undefined)[]) => void;
@@ -15,6 +17,13 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 
 export const useProfiles = create<ProfilesState>((set, get) => ({
   byId: {},
+  reset: () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    queue.clear();
+    requested.clear();
+    set({ byId: {} });
+  },
   upsert: (profiles) => {
     if (profiles.length === 0) return;
     const next = { ...get().byId };
@@ -30,20 +39,25 @@ export const useProfiles = create<ProfilesState>((set, get) => ({
       }
     }
     if (queue.size === 0 || timer) return;
+    const session = sessionSignal();
     timer = setTimeout(async () => {
+      if (session.aborted) return;
       const batch = [...queue];
       queue = new Set();
       timer = null;
       for (let i = 0; i < batch.length; i += 100) {
         const chunk = batch.slice(i, i + 100);
         const { data } = await supabase.from('profiles').select('*').in('id', chunk);
+        if (session.aborted) return;
         if (data) get().upsert(data as Profile[]);
         else chunk.forEach((id) => requested.delete(id));
       }
     }, 30);
   },
   fetchOne: async (id) => {
+    const session = sessionSignal();
     const { data } = await supabase.from('profiles').select('*').eq('id', id).maybeSingle();
+    if (session.aborted) return null;
     if (data) get().upsert([data as Profile]);
     return (data as Profile) ?? null;
   },

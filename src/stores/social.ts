@@ -1,3 +1,4 @@
+import { sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
 import { errorMessage } from '@/lib/errors';
@@ -45,6 +46,7 @@ export const useSocial = create<SocialState>((set, get) => ({
   reset: () => set({ friendships: [], blocked: [], dms: [], loaded: false }),
 
   load: async () => {
+    const session = sessionSignal();
     const me = useAuth.getState().userId;
     if (!me) return;
     const [f, b, d] = await Promise.all([
@@ -52,6 +54,7 @@ export const useSocial = create<SocialState>((set, get) => ({
       supabase.from('blocks').select('blocked_id').eq('blocker_id', me),
       supabase.from('dm_conversations').select('*').order('last_message_at', { ascending: false }).limit(200),
     ]);
+    if (session.aborted) return;
     const friendships = (f.data ?? []) as Friendship[];
     const dms = (d.data ?? []) as DmConversation[];
     useProfiles.getState().ensure([...friendships.map((x) => otherUser(x, me)), ...dms.map((x) => dmPeer(x, me))]);

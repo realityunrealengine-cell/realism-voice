@@ -114,6 +114,7 @@ export class SupervisedChannel {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.generation++;
     this.clearRetry();
     const ch = this.ch;
     this.ch = null;
@@ -122,6 +123,7 @@ export class SupervisedChannel {
       if (this.payload) await ch.untrack().catch(() => undefined);
       await this.o.client.removeChannel(ch).catch(() => undefined);
     }
+    await this.recreating;
   }
 
   /** Немедленно пересоздать канал (например, после выхода из сна) */

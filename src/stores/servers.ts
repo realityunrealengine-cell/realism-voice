@@ -1,3 +1,4 @@
+import { sessionSignal } from '@/lib/sessionLifetime';
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
 import { errorMessage } from '@/lib/errors';
@@ -71,6 +72,7 @@ export const useServers = create<ServersState>((set, get) => ({
   reset: () => set({ loaded: false, servers: [], myRoles: {}, categories: {}, channels: {}, members: {}, membersLoaded: {} }),
 
   loadAll: async () => {
+    const session = sessionSignal();
     const uid = useAuth.getState().userId;
     if (!uid) return;
     const [srv, mine, cats, chans] = await Promise.all([
@@ -79,6 +81,7 @@ export const useServers = create<ServersState>((set, get) => ({
       supabase.from('categories').select('*'),
       supabase.from('channels').select('*'),
     ]);
+    if (session.aborted) return;
     if (srv.error) fail(srv.error);
     const roles: Record<string, ServerRole> = {};
     const joinedAt: Record<string, string> = {};
@@ -97,12 +100,14 @@ export const useServers = create<ServersState>((set, get) => ({
   },
 
   loadServer: async (serverId) => {
+    const session = sessionSignal();
     const [srv, cats, chans, me] = await Promise.all([
       supabase.from('servers').select('*').eq('id', serverId).maybeSingle(),
       supabase.from('categories').select('*').eq('server_id', serverId),
       supabase.from('channels').select('*').eq('server_id', serverId),
       supabase.from('server_members').select('*').eq('server_id', serverId).eq('user_id', useAuth.getState().userId ?? '').maybeSingle(),
     ]);
+    if (session.aborted) return;
     if (!srv.data) return;
     const s = get();
     const exists = s.servers.some((x) => x.id === serverId);
@@ -115,11 +120,13 @@ export const useServers = create<ServersState>((set, get) => ({
   },
 
   loadMembers: async (serverId) => {
+    const session = sessionSignal();
     const { data, error } = await supabase
       .from('server_members')
       .select('*, profile:profiles(*)')
       .eq('server_id', serverId)
       .limit(5000);
+    if (session.aborted) return;
     if (error) return;
     const rows = (data ?? []) as (Member & { profile: Profile | null })[];
     useProfiles.getState().upsert(rows.map((r) => r.profile).filter((p): p is Profile => !!p));
