@@ -15,6 +15,7 @@ import { useUi } from '@/stores/ui';
 import { useSettings } from '@/stores/settings';
 import { useVoice } from '@/stores/voice';
 import { useCalls } from '@/stores/calls';
+import { handleIncomingMessage } from './incomingMessage';
 import { sounds } from './sounds';
 import { cleanupStaleUploads } from './media';
 import { onBeforeSignOut } from '@/stores/auth';
@@ -33,13 +34,7 @@ function rowOf<T>(p: RealtimePostgresChangesPayload<Record<string, unknown>>): P
   return (p.eventType === 'DELETE' ? p.old : p.new) as Partial<T>;
 }
 
-export function activeScopeId(): string | null {
-  const ui = useUi.getState();
-  if (ui.settingsOpen) return null;
-  if (ui.view.kind === 'dm') return ui.view.dmId;
-  if (ui.view.kind === 'server' && !ui.voiceViewOpen) return ui.lastChannel[ui.view.serverId] ?? null;
-  return null;
-}
+export { activeScopeId } from './incomingMessage';
 
 function notify(title: string, body: string, onClick: () => void) {
   const prefs = useSettings.getState().prefs.notifications;
@@ -59,55 +54,7 @@ function notify(title: string, body: string, onClick: () => void) {
 }
 
 function handleMessageInsert(msg: Message) {
-  const me = useAuth.getState().userId;
-  useMessages.getState().applyRemote(msg);
-  if (!me || msg.author_id === me || msg.deleted_at) return;
-
-  const scopeId = (msg.channel_id ?? msg.dm_id)!;
-  const isActive = activeScopeId() === scopeId && document.hasFocus();
-  const author = useProfiles.getState().byId[msg.author_id];
-  const authorName = author?.display_name ?? 'Новое сообщение';
-
-  if (msg.kind === 'call' && msg.dm_id) {
-    if (Date.now() - new Date(msg.created_at).getTime() < 60_000) {
-      const v = useVoice.getState();
-      const inThisCall = v.target?.kind === 'dm' && v.target.dmId === msg.dm_id;
-      if (!inThisCall) {
-        useCalls.getState().ring({ dmId: msg.dm_id, from: msg.author_id });
-        notify(authorName, 'Входящий звонок', () => useUi.getState().setView({ kind: 'dm', dmId: msg.dm_id! }));
-      }
-    }
-  }
-
-  if (isActive) {
-    useUnread.getState().markRead(scopeId);
-    return;
-  }
-
-  const prefs = useSettings.getState().prefs.notifications;
-  if (msg.dm_id) {
-    if (useSocial.getState().blocked.includes(msg.author_id)) return;
-    useUnread.getState().bump(scopeId, null, true);
-    if (prefs.dms && msg.kind === 'default') {
-      sounds.message();
-      notify(authorName, msg.content || 'Вложение', () => useUi.getState().setView({ kind: 'dm', dmId: msg.dm_id! }));
-    }
-    return;
-  }
-
-  const ch = Object.values(useServers.getState().channels).flat().find((c) => c.id === msg.channel_id);
-  if (!ch) return;
-  const mentioned = msg.mentions.includes(me) || msg.mention_everyone;
-  useUnread.getState().bump(scopeId, ch.server_id, mentioned);
-  const muted = prefs.mutedServers.includes(ch.server_id);
-  const should = !muted && (prefs.serverMode === 'all' || (prefs.serverMode === 'mentions' && mentioned));
-  if (should || (mentioned && prefs.serverMode !== 'none')) {
-    mentioned ? sounds.mention() : sounds.message();
-    const server = useServers.getState().servers.find((s) => s.id === ch.server_id);
-    notify(`${authorName} • #${ch.name}${server ? ` (${server.name})` : ''}`, msg.content || 'Вложение', () =>
-      useUi.getState().openChannel(ch.server_id, ch.id),
-    );
-  }
+  handleIncomingMessage(msg, { notify, ring: useCalls.getState().ring });
 }
 
 export function startRealtime() {
