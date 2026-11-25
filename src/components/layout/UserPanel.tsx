@@ -10,6 +10,7 @@ import { STATUS_LABEL, type PresenceStatus } from '@/lib/types';
 import { StatusDot } from '@/components/ui/Avatar';
 import { UserBadge } from '@/components/ui/UserBadge';
 import { CallTimer } from '@/components/voice/CallTimer';
+import { TransportBadge } from '@/components/voice/TransportBadge';
 import { UpdatesButton } from '@/components/settings/UpdatesSection';
 import { toast } from '@/stores/ui';
 
@@ -40,6 +41,7 @@ function VoiceStatus() {
         <div className="min-w-0 flex-1">
           <div className={`flex items-baseline justify-between gap-2 text-sm font-semibold ${status === 'connected' ? 'text-emerald-400' : TONE_TEXT[tone]}`}>
             <span className="truncate">{status === 'connected' ? 'Голосовая связь' : VOICE_STATUS_UI[status].label}</span>
+            <TransportBadge className="shrink-0" />
             <CallTimer className="shrink-0 text-xs" />
           </div>
           <button

@@ -8,6 +8,8 @@ import { AccountSection, PrivacySection, ProfileSection } from './AccountSection
 import { VoiceSection } from './VoiceSection';
 import { AboutSection, AppearanceSection, HotkeysSection, NotificationsSection, WindowsSection } from './AppSections';
 import { UpdatesSection } from './UpdatesSection';
+import { NetworkSection } from './NetworkSection';
+import { SecuritySection } from './SecuritySection';
 
 const SECTIONS: { group: string; items: { id: string; label: string }[] }[] = [
   {
@@ -15,6 +17,7 @@ const SECTIONS: { group: string; items: { id: string; label: string }[] }[] = [
     items: [
       { id: 'account', label: 'Мой аккаунт' },
       { id: 'profile', label: 'Профиль' },
+      { id: 'security', label: 'Безопасность' },
       { id: 'privacy', label: 'Конфиденциальность' },
     ],
   },
@@ -23,6 +26,7 @@ const SECTIONS: { group: string; items: { id: string; label: string }[] }[] = [
     items: [
       { id: 'notifications', label: 'Уведомления' },
       { id: 'voice', label: 'Голос и видео' },
+      { id: 'network', label: 'Сеть и P2P' },
       { id: 'hotkeys', label: 'Горячие клавиши' },
       { id: 'appearance', label: 'Внешний вид' },
       { id: 'windows', label: 'Windows' },
@@ -91,9 +95,11 @@ export function SettingsView() {
           <h1 className="mb-6 text-xl font-bold text-white">{label}</h1>
           {section === 'account' && <AccountSection />}
           {section === 'profile' && <ProfileSection />}
+          {section === 'security' && <SecuritySection />}
           {section === 'privacy' && <PrivacySection />}
           {section === 'notifications' && <NotificationsSection />}
           {section === 'voice' && <VoiceSection />}
+          {section === 'network' && <NetworkSection />}
           {section === 'hotkeys' && <HotkeysSection />}
           {section === 'appearance' && <AppearanceSection />}
           {section === 'windows' && <WindowsSection />}

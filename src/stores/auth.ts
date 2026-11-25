@@ -5,8 +5,9 @@ import { errorMessage, toAppError } from '@/lib/errors';
 import type { Profile } from '@/lib/types';
 import type { DeepLink } from '../../electron/shared';
 import { useProfiles } from './profiles';
+import { security } from '@/lib/security';
 
-export type AuthStatus = 'loading' | 'signedOut' | 'signedIn' | 'recovery' | 'dbMissing';
+export type AuthStatus = 'loading' | 'signedOut' | 'signedIn' | 'recovery' | 'dbMissing' | 'mfa';
 
 interface AuthState {
   status: AuthStatus;
@@ -27,6 +28,10 @@ interface AuthState {
   loadProfile: () => Promise<void>;
   updateProfile: (patch: Partial<Profile>) => Promise<void>;
   setNotice: (n: string | null) => void;
+  /** Вход со вторым фактором: код из приложения-аутентификатора */
+  verifyMfa: (code: string) => Promise<void>;
+  /** Вход по резервному коду (2FA будет сброшена — её нужно настроить заново) */
+  redeemRecovery: (code: string) => Promise<void>;
 }
 
 let initialized = false;
@@ -75,6 +80,11 @@ export const useAuth = create<AuthState>((set, get) => ({
   loadProfile: async () => {
     const uid = get().userId;
     if (!uid) return;
+    // Включена 2FA, а сессия подтверждена только паролем — сначала код второго фактора
+    if (get().status !== 'recovery' && (await security.needsSecondFactor().catch(() => false))) {
+      set({ status: 'mfa' });
+      return;
+    }
     const { data, error } = await supabase.from('profiles').select('*').eq('id', uid).maybeSingle();
     if (error) {
       if (error.code === 'PGRST205' || error.code === '42P01') {
@@ -205,4 +215,21 @@ export const useAuth = create<AuthState>((set, get) => ({
   },
 
   setNotice: (notice) => set({ notice }),
+
+  verifyMfa: async (code) => {
+    const { verified } = await security.factors();
+    const f = verified[0];
+    if (!f) throw new Error('Фактор 2FA не найден — войдите заново');
+    await security.verify(f.id, code);
+    set({ status: 'loading' });
+    await get().loadProfile();
+  },
+
+  redeemRecovery: async (code) => {
+    await security.recoveryRedeem(code);
+    // Факторы сняты на сервере — новая сессия без требования второго фактора
+    await supabase.auth.refreshSession();
+    set({ status: 'loading', notice: 'Вход по резервному коду выполнен. Двухфакторная аутентификация отключена — настройте её заново в «Безопасность».' });
+    await get().loadProfile();
+  },
 }));

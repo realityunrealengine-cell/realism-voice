@@ -21,6 +21,10 @@ export class FakeRealtimeServer {
   broadcast(topic: string) {
     for (const ch of [...this.channels]) if (ch.topic === topic) ch.receive(this.state(topic));
   }
+  /** Сообщение broadcast всем остальным подписчикам темы (как в Supabase: себе не доставляется) */
+  send(from: FakeChannel, event: string, payload: unknown) {
+    for (const ch of [...this.channels]) if (ch.topic === from.topic && ch !== from) queueMicrotask(() => ch.deliver(event, payload));
+  }
 }
 
 export class FakeChannel implements RtChannel {
@@ -28,6 +32,7 @@ export class FakeChannel implements RtChannel {
   tracked: Meta | null = null;
   key: string;
   private syncCb: (() => void) | null = null;
+  private bcast: ((m: { event: string; payload: unknown }) => void) | null = null;
   private last: Record<string, Meta[]> = {};
   constructor(
     private readonly client: FakeRtClient,
@@ -36,9 +41,18 @@ export class FakeChannel implements RtChannel {
   ) {
     this.key = opts.config.presence.key;
   }
-  on(_t: 'presence', _f: { event: 'sync' }, cb: () => void) {
-    this.syncCb = cb;
+  on(t: 'presence' | 'broadcast', _f: { event: string }, cb: (m: { event: string; payload: unknown }) => void) {
+    if (t === 'broadcast') this.bcast = cb;
+    else this.syncCb = cb as () => void;
     return this;
+  }
+  async send(msg: { type: 'broadcast'; event: string; payload: Record<string, unknown> }) {
+    if (this.status !== 'joined') return 'error';
+    this.client.server.send(this, msg.event, JSON.parse(JSON.stringify(msg.payload)));
+    return 'ok';
+  }
+  deliver(event: string, payload: unknown) {
+    if (this.status === 'joined') this.bcast?.({ event, payload });
   }
   subscribe(cb: (s: SubscribeStatus, e?: Error) => void) {
     if (this.status !== 'closed') return this;

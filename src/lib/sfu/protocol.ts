@@ -35,6 +35,8 @@ export interface RoomMember {
   muted: boolean;
   deafened: boolean;
   quality: Quality;
+  /** Устройство умеет и готово соединяться напрямую (P2P, версия 1.3.0+; в личных звонках) */
+  p2p: boolean;
 }
 
 /** Что участник сообщает о себе в presence */
@@ -47,6 +49,8 @@ export interface RoomPresencePayload {
   muted: boolean;
   deafened: boolean;
   quality: Quality;
+  /** 1 — готов к прямому соединению; старые версии поле не отправляют */
+  p2p?: 1;
 }
 
 export function roomTopic(target: { kind: 'channel'; channelId: string } | { kind: 'dm'; dmId: string }): string {
@@ -85,6 +89,7 @@ export function parseMember(meta: Record<string, unknown> | null | undefined): R
     muted: meta.muted === true,
     deafened: meta.deafened === true,
     quality: QUALITIES.includes(meta.quality as Quality) ? (meta.quality as Quality) : 'unknown',
+    p2p: meta.p2p === 1,
   };
 }
 

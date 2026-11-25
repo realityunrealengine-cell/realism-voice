@@ -14,6 +14,12 @@ create table auth.users (id uuid primary key, email text, raw_user_meta_data jso
 create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
 grant usage on schema auth, storage, realtime, public to anon, authenticated;
 grant execute on function auth.uid() to anon, authenticated;
+create function auth.jwt() returns jsonb language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $$;
+grant execute on function auth.jwt() to anon, authenticated;
+create table auth.mfa_factors (id uuid primary key default gen_random_uuid(), user_id uuid, factor_type text default 'totp', status text);
+create type auth.aal_level as enum ('aal1', 'aal2', 'aal3');
+create table auth.sessions (id uuid primary key default gen_random_uuid(), user_id uuid, created_at timestamptz default now(), updated_at timestamptz, user_agent text, ip inet, aal auth.aal_level);
+create role authenticator nologin;
 create table storage.buckets (id text primary key, name text, public boolean, file_size_limit bigint, allowed_mime_types text[]);
 create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text, owner uuid, metadata jsonb, created_at timestamptz default now());
 create function storage.foldername(name text) returns text[] language plpgsql immutable as $$
@@ -443,6 +449,39 @@ eq('re-run keeps tester', await badgeOf(A), 'tester');
 eq('admin revoke removes tester', (await db.query(fill(adminRevoke, A))).rows[0].badge, null);
 eq('tester revoked', await badgeOf(A), null);
 eq('second revoke does nothing', (await db.query(fill(adminRevoke, A))).rows.length, 0);
+
+// ---------- 0010: двухфакторная аутентификация и сессии ----------
+console.log('\n2FA / sessions (0010)');
+async function asAal(uid, aal, sql, params = []) {
+  const claims = JSON.stringify({ sub: uid, aal, session_id: '00000000-0000-4000-8000-0000000000e1' });
+  await db.exec(`reset role; select set_config('request.jwt.claim.sub', '${uid}', false); select set_config('request.jwt.claims', '${claims}', false); set role authenticated;`);
+  try { return await db.query(sql, params); } finally { await db.exec(`reset role; select set_config('request.jwt.claims', '', false)`); }
+}
+eq('without 2FA: aal1 session reads own profile', (await asAal(B, 'aal1', 'select id from public.profiles where id=$1', [B])).rows.length, 1);
+await expectOk('without 2FA: request check passes', () => asAal(B, 'aal1', 'select public.rv_check_request()'));
+await db.exec(`insert into auth.mfa_factors (user_id, status) values ('${B}', 'verified'), ('${A}', 'unverified')`);
+eq('2FA enabled: aal1 session sees no profiles', (await asAal(B, 'aal1', 'select id from public.profiles')).rows.length, 0);
+eq('2FA enabled: aal1 session sees no messages', (await asAal(B, 'aal1', 'select id from public.messages')).rows.length, 0);
+await expectErr('2FA enabled: aal1 request is rejected before any RPC', () => asAal(B, 'aal1', 'select public.rv_check_request()'));
+eq('2FA enabled: aal1 update changes nothing', (await asAal(B, 'aal1', `update public.profiles set bio='hacked' where id=$1`, [B])).affectedRows ?? 0, 0);
+eq('2FA enabled: aal2 session reads own profile', (await asAal(B, 'aal2', 'select id from public.profiles where id=$1', [B])).rows.length, 1);
+await expectOk('2FA enabled: aal2 request check passes', () => asAal(B, 'aal2', 'select public.rv_check_request()'));
+eq('unverified factor does not require 2FA', (await asAal(A, 'aal1', 'select id from public.profiles where id=$1', [A])).rows.length, 1);
+await db.exec(`insert into auth.sessions (id, user_id, aal, user_agent, ip) values
+  ('00000000-0000-4000-8000-0000000000e1', '${B}', 'aal2', 'RealismVoice/1.3.0', '10.0.0.1'),
+  ('00000000-0000-4000-8000-0000000000e2', '${B}', 'aal1', 'RealismVoice/1.2.3', '10.0.0.2'),
+  ('00000000-0000-4000-8000-0000000000e3', '${A}', 'aal1', 'x', null)`);
+const sess = (await asAal(B, 'aal2', 'select id, is_current from public.my_sessions()')).rows;
+eq('my_sessions lists only own sessions', sess.length, 2);
+eq('current session is marked', sess.filter((r) => r.is_current).map((r) => r.id), ['00000000-0000-4000-8000-0000000000e1']);
+eq('cannot revoke a foreign session', (await asAal(B, 'aal2', `select public.revoke_session('00000000-0000-4000-8000-0000000000e3') ok`)).rows[0].ok, false);
+eq('foreign session still exists', (await db.query(`select count(*)::int n from auth.sessions where user_id='${A}'`)).rows[0].n, 1);
+await expectErr('aal1 cannot revoke sessions when 2FA is on', () => asAal(B, 'aal1', `select public.revoke_session('00000000-0000-4000-8000-0000000000e2')`));
+eq('revoke own other session', (await asAal(B, 'aal2', `select public.revoke_session('00000000-0000-4000-8000-0000000000e2') ok`)).rows[0].ok, true);
+await expectErr('clients cannot read recovery code hashes', () => as(B, 'select * from public.mfa_recovery_codes'));
+await expectErr('clients cannot write recovery attempts', () => as(B, `insert into public.mfa_recovery_attempts (user_id, ok) values ($1, true)`, [B]));
+await db.exec(`delete from auth.mfa_factors`);
+eq('2FA disabled again: aal1 reads profile', (await asAal(B, 'aal1', 'select id from public.profiles where id=$1', [B])).rows.length, 1);
 
 console.log(failures ? `\n${failures} FAILURES` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

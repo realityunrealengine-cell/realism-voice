@@ -38,6 +38,12 @@ export interface Prefs {
   screenQuality: '720p' | '1080p' | '1080p60' | '1440p60';
   screenAudio: boolean;
   showLinkPreviews: boolean;
+  /** Личные звонки напрямую (P2P); если не получилось — через сервер */
+  callP2p: boolean;
+  /** Не раскрывать свой IP собеседнику: прямые соединения только через TURN */
+  p2pRelayOnly: boolean;
+  /** Доставка личных сообщений: сначала P2P / только P2P / только сервер */
+  messageMode: 'auto' | 'p2p' | 'server';
 }
 
 export const DEFAULT_PREFS: Prefs = {
@@ -74,6 +80,11 @@ export const DEFAULT_PREFS: Prefs = {
   screenQuality: '1440p60',
   screenAudio: false,
   showLinkPreviews: true,
+  callP2p: true,
+  p2pRelayOnly: false,
+  // Сообщения по умолчанию — как раньше, через сервер: P2P-сообщения хранятся только на устройствах
+  // собеседников, и пользователь включает это сознательно (см. «Сеть и P2P»)
+  messageMode: 'server',
 };
 
 interface SettingsState {

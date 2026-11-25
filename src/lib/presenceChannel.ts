@@ -18,6 +18,8 @@ export type SubscribeStatus = 'SUBSCRIBED' | 'TIMED_OUT' | 'CLOSED' | 'CHANNEL_E
 
 export interface RtChannel {
   on(type: 'presence', filter: { event: 'sync' }, cb: () => void): RtChannel;
+  on(type: 'broadcast', filter: { event: string }, cb: (msg: { event: string; payload: unknown }) => void): RtChannel;
+  send?(msg: { type: 'broadcast'; event: string; payload: Record<string, unknown> }): Promise<unknown>;
   subscribe(cb: (status: SubscribeStatus, err?: Error) => void): RtChannel;
   track(payload: Record<string, unknown>): Promise<unknown>;
   untrack(): Promise<unknown>;
@@ -53,6 +55,8 @@ export interface SupervisedOptions {
   session: string;
   onSync: (state: Record<string, Record<string, unknown>[]>) => void;
   onJoinedChange?: (joined: boolean) => void;
+  /** Сообщения broadcast в той же теме (сигнализация прямых P2P-соединений) */
+  onBroadcast?: (event: string, payload: unknown) => void;
   timers?: Timers;
   log?: (msg: string) => void;
 }
@@ -90,6 +94,14 @@ export class SupervisedChannel {
   setPayload(payload: Record<string, unknown> | null): void {
     this.payload = payload ? { ...payload, session: this.o.session } : null;
     if (this.joined) void this.push();
+  }
+
+  /** Отправить broadcast-сообщение участникам темы (только когда канал подключён) */
+  send(event: string, payload: Record<string, unknown>): boolean {
+    const ch = this.ch;
+    if (!ch || !this.joined || !ch.send) return false;
+    void ch.send({ type: 'broadcast', event, payload }).catch(() => undefined);
+    return true;
   }
 
   /** Сверка без сетевых запросов; при расхождении — восстановление */
@@ -151,6 +163,12 @@ export class SupervisedChannel {
       ch.on('presence', { event: 'sync' }, () => {
         if (gen === this.generation) this.o.onSync(ch.presenceState());
       });
+      if (this.o.onBroadcast) {
+        const fn = this.o.onBroadcast;
+        ch.on('broadcast', { event: '*' }, (m) => {
+          if (gen === this.generation && m && typeof m.event === 'string') fn(m.event, m.payload);
+        });
+      }
     } catch (e) {
       // Клиент вернул прежний, ещё не закрытый канал с той же темой — убираем его и пробуем снова
       this.o.log?.(`${this.o.topic}: stale channel (${(e as Error).message})`);

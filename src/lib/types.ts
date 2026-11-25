@@ -112,6 +112,10 @@ export interface Message {
   /** Только на клиенте */
   _status?: 'sending' | 'failed';
   _error?: string;
+  /** Сообщение доставлено напрямую (P2P) и хранится только на устройствах собеседников */
+  _via?: 'p2p';
+  /** Состояние P2P-доставки своего сообщения: ждёт получателя / подтверждено получателем */
+  _delivery?: 'queued' | 'delivered';
 }
 
 export interface DmConversation {

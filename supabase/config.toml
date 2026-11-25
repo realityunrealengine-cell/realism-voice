@@ -6,6 +6,10 @@ project_id = "realism-voice"
 # Посредник к Cloudflare Realtime SFU. JWT проверяется внутри функции через auth.getUser().
 verify_jwt = false
 
+[functions.account-security]
+# Резервные коды 2FA. JWT проверяется внутри функции через auth.getUser().
+verify_jwt = false
+
 # Прежний голосовой сервер (LiveKit) — оставлен для версий 1.1.x и как вариант отката.
 [functions.livekit-token]
 # JWT проверяется внутри функции через auth.getUser() — это работает и с новыми

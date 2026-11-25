@@ -14,5 +14,5 @@
       "npm:@supabase/supabase-js@2": ["node_modules/@supabase/supabase-js"]
     }
   },
-  "include": ["_types/deno.d.ts", "voice-sfu/index.ts"]
+  "include": ["_types/deno.d.ts", "voice-sfu/index.ts", "account-security/index.ts"]
 }

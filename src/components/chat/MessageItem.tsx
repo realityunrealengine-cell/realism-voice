@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Copy, CornerUpLeft, Pencil, Phone, RotateCw, SmilePlus, Trash2, Hash } from 'lucide-react';
+import { AlertTriangle, ArrowLeftRight, Clock, Copy, CornerUpLeft, Pencil, Phone, RotateCw, SmilePlus, Trash2, Hash } from 'lucide-react';
 import type { Message, Scope } from '@/lib/types';
 import { roleAtLeast, ROLE_RANK } from '@/lib/types';
 import { useProfile, useProfiles } from '@/stores/profiles';
@@ -221,6 +221,7 @@ export const MessageItem = memo(function MessageItem({ message: m, scope, server
               </div>
             )
           )}
+          {m._via === 'p2p' && !m.deleted_at && <P2pMark m={m} />}
           <Attachments list={m.attachments} pending={m._status === 'sending'} />
           {invites.map((code) => (
             <InviteEmbed key={code} code={code} />
@@ -297,4 +298,18 @@ export function lastOwnEditable(scopeId: string, me: string): Message | undefine
     if (m.author_id === me && !m.deleted_at && !m._status && m.kind === 'default') return m;
   }
   return undefined;
+}
+
+/** Пометка P2P-сообщения: доставлено напрямую, хранится только на устройствах собеседников */
+function P2pMark({ m }: { m: Message }) {
+  const queued = m._delivery === 'queued';
+  const title = queued
+    ? 'Ожидает получателя: будет доставлено напрямую (P2P), когда собеседник появится в сети. Хранится в очереди на этом компьютере.'
+    : 'Доставлено напрямую (P2P), сквозное шифрование X25519 + ML-KEM-768 → AES-256-GCM. На сервере не хранится — только на устройствах собеседников.';
+  return (
+    <span title={title} className={`mt-0.5 inline-flex items-center gap-1 rounded px-1 text-[10px] font-semibold ${queued ? 'text-amber-300/90' : 'text-emerald-300/80'}`}>
+      {queued ? <Clock className="h-3 w-3" /> : <ArrowLeftRight className="h-3 w-3" />}
+      {queued ? 'P2P · ожидает получателя' : m._delivery === 'delivered' ? 'P2P · доставлено' : 'P2P'}
+    </span>
+  );
 }

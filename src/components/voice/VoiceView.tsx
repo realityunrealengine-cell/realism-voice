@@ -14,6 +14,7 @@ import { Slider, Spinner } from '@/components/ui/primitives';
 import { UserBadge } from '@/components/ui/UserBadge';
 import { QUALITY } from '@/components/layout/UserPanel';
 import { CallTimer } from './CallTimer';
+import { TransportBadge } from './TransportBadge';
 import { TONE_DOT, TONE_PILL, VOICE_STATUS_UI } from './voiceStatusUi';
 
 function TrackVideo({ track, mirror, contain }: { track: MediaStreamTrack; mirror?: boolean; contain?: boolean }) {
@@ -192,6 +193,7 @@ export function VoiceView() {
           {VOICE_STATUS_UI[status].label}
         </span>
         <CallTimer className="ml-1 rounded-md bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300" />
+        <TransportBadge className="ml-1" />
         <div className="flex-1" />
         <button className="icon-btn" title="Открыть чат" onClick={() => ui.setVoiceViewOpen(false)}>
           <MessageSquare className="h-[18px] w-[18px]" />

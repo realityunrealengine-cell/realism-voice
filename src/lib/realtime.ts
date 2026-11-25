@@ -18,6 +18,8 @@ import { sounds } from './sounds';
 import { cleanupStaleUploads } from './media';
 import { onBeforeSignOut } from '@/stores/auth';
 import { useConnectivity } from '@/stores/connectivity';
+import { jsonBytes, useNetStats } from '@/stores/netStats';
+import { p2p } from './p2p/integration';
 
 let channel: RealtimeChannel | null = null;
 
@@ -56,7 +58,8 @@ function notify(title: string, body: string, onClick: () => void) {
   }
 }
 
-function handleMessageInsert(msg: Message) {
+/** Новое сообщение: с сервера (Realtime) или напрямую от собеседника (P2P) */
+export function handleMessageInsert(msg: Message) {
   const me = useAuth.getState().userId;
   useMessages.getState().applyRemote(msg);
   if (!me || msg.author_id === me || msg.deleted_at) return;
@@ -114,9 +117,10 @@ export function startRealtime() {
   const gen = ++channelGen;
   channel = supabase
     .channel('db-changes')
-    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (p) =>
-      handleMessageInsert(p.new as Message),
-    )
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (p) => {
+      useNetStats.getState().add('serverMsg', 0, jsonBytes(p.new));
+      handleMessageInsert(p.new as Message);
+    })
     .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, (p) =>
       useMessages.getState().applyRemote(p.new as Message),
     )
@@ -224,6 +228,8 @@ export async function bootstrap() {
   await Promise.allSettled([useServers.getState().loadAll(), useSocial.getState().load(), useUnread.getState().load()]);
   startRealtime();
   usePresence.getState().start(auth.userId, auth.profile.status);
+  // Прямые (P2P) сообщения: каналы к собеседникам в сети, очередь, синхронизация истории
+  p2p.start({ incoming: handleMessageInsert, apply: (m) => useMessages.getState().applyRemote(m) });
   // Профили собеседников в ЛС
   const me = auth.userId;
   useProfiles.getState().ensure(useSocial.getState().dms.map((d) => dmPeer(d, me)));
@@ -233,6 +239,7 @@ export async function bootstrap() {
 
 export function teardown() {
   stopRealtime();
+  void p2p.stop();
   void usePresence.getState().stop();
   void useVoice.getState().leave();
   useServers.getState().reset();

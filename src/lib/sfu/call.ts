@@ -7,12 +7,24 @@
 //   Участник при этом остаётся в комнате (присутствие сохраняется), у остальных нет «мигания».
 //   Паузы между попытками и ожидание сети — reconnectPolicy; через минуту без успеха — «Соединение потеряно».
 //   close():  снятие присутствия, закрытие RTCPeerConnection и треков в SFU.
+//
+// Личный звонок (1.3.0): если оба устройства готовы (поле p2p в presence) и пользователь не запретил,
+// медиа идут НАПРЯМУЮ между компьютерами (DirectMedia, WebRTC + STUN, резерв — TURN), а Cloudflare SFU
+// не используется вовсе. Если прямое соединение не установилось за DIRECT_TIMEOUT_MS или оборвалось
+// без восстановления, обе стороны переходят на SFU (публикация + подписка, как раньше) без выхода из звонка.
+// Старые версии приложения поле p2p не присылают — с ними звонок сразу идёт через SFU.
 import { SupervisedChannel, type RtClient } from '@/lib/presenceChannel';
 import { nextReconnect } from '@/lib/reconnectPolicy';
 import type { JoinResult, JoinTarget, SessionGrant, VoiceApi } from './api';
 import { ClosedError, defaultPcFactory, Publisher, rtcConfig, Subscriber, type PcFactory, type PublishItem } from './peer';
 import { desiredTracks, reduceRoom, roomTopic, type Quality, type RoomMember, type RoomPresencePayload, type Source } from './protocol';
 import { countersFromStats, qualityFrom, worst, type LinkCounters } from './quality';
+import { DirectMedia, type DirectState, type MediaSignal } from '@/lib/p2p/directMedia';
+import { snapshotFromStats } from '@/lib/p2p/linkStats';
+
+/** Каким путём сейчас идут медиа звонка: напрямую, через TURN, через Cloudflare SFU; pending — идёт установка */
+export type CallTransport = 'p2p' | 'relay' | 'sfu' | 'pending';
+export type TrafficKind = 'p2p' | 'relay' | 'sfu';
 
 export interface CallEvents {
   roster(others: RoomMember[]): void;
@@ -22,6 +34,7 @@ export interface CallEvents {
   superseded(): void;
   speaking(userIds: Set<string>): void;
   quality(q: Quality): void;
+  transport?(t: CallTransport | null): void;
 }
 
 export interface CallDeps {
@@ -33,6 +46,10 @@ export interface CallDeps {
   log?: (msg: string) => void;
   /** Уровень принятого звука участника (RMS 0..1) — для индикатора «говорит» */
   level?: (userId: string) => number | null;
+  /** Прямые соединения в личных звонках: разрешены ли и только ли через TURN (не раскрывать IP) */
+  direct?: { allowed: boolean; relayOnly: boolean };
+  /** Измеренный объём медиатрафика (байты, приращение) по типу пути — для статистики */
+  traffic?: (kind: TrafficKind, sent: number, received: number) => void;
 }
 
 export class RoomFullError extends Error {
@@ -52,6 +69,15 @@ const STATS_MS = 3_000;
 const WATCHDOG_MS = 20_000;
 /** Сколько держать участника, пропавшего из presence, прежде чем считать, что он ушёл */
 export const DEPARTED_GRACE_MS = 4_000;
+/** Сколько ждать прямого соединения, прежде чем перейти на SFU */
+export const DIRECT_TIMEOUT_MS = 10_000;
+const DIRECT_SIGNAL = 'p2p-call';
+/**
+ * Сессия SFU, выданная при входе, но не использованная, через несколько секунд считается Cloudflare
+ * отключённой (HTTP 410 «Session appears to be disconnected» — найдено реальной проверкой при переходе
+ * с P2P на SFU посреди звонка). Старше этого возраста сессии запрашиваются заново.
+ */
+const GRANT_MAX_AGE_MS = 8_000;
 
 type Scope = 'pub' | 'sub';
 export type LocalSources = Partial<Record<Source, Omit<PublishItem, 'source'>>>;
@@ -108,7 +134,23 @@ export class SfuCall {
   private speakingNow = new Set<string>();
   private loudAt = new Map<string, number>();
   private counters = new Map<RTCPeerConnection, LinkCounters>();
+  private bytes = new Map<RTCPeerConnection, { sent: number; received: number }>();
   private readonly pcFactory: PcFactory;
+  // ---- прямое соединение (личный звонок) ----
+  private direct: DirectMedia | null = null;
+  private directKey: string | null = null;
+  private directState: 'idle' | 'trying' | 'connected' | 'failed' = 'idle';
+  private directTimer: ReturnType<typeof setTimeout> | null = null;
+  private failedFor: string | null = null;
+  /** После перехода на SFU он остаётся основным, пока прямое соединение снова не установится */
+  private sfuHold = false;
+  private pendingSignals: { key: string; at: number; msg: MediaSignal }[] = [];
+  private readonly sfuTracks = new Map<string, MediaStreamTrack>();
+  private readonly directTracks = new Map<string, MediaStreamTrack>();
+  private readonly emitted = new Map<string, MediaStreamTrack | null>();
+  private transportNow: CallTransport | null = null;
+  /** Когда выданы сессии входа: неиспользованную сессию Cloudflare вскоре считает отключённой */
+  private grantAt = 0;
 
   constructor(
     readonly target: JoinTarget,
@@ -136,6 +178,7 @@ export class SfuCall {
     this.config = rtcConfig(res.ice_servers);
     this.pubGrant = res.pub;
     this.subGrant = res.sub;
+    this.grantAt = Date.now();
     const localP: Promise<LocalSources> = provide ? provide(this.canSpeak).catch(() => ({})) : Promise.resolve({});
 
     // Присутствие в комнате: кто здесь и какие треки публикует
@@ -148,6 +191,9 @@ export class SfuCall {
         session: this.session,
         log: this.deps.log,
         onSync: (state) => this.onSync(state),
+        onBroadcast: (event, payload) => {
+          if (event === DIRECT_SIGNAL) this.onDirectSignal(payload);
+        },
         onJoinedChange: (joined) => {
           if (joined) {
             clearTimeout(t);
@@ -166,7 +212,9 @@ export class SfuCall {
     this.assertOpen();
     for (const [k, v] of Object.entries(initial) as [Source, Omit<PublishItem, 'source'>][]) if (v) this.local.set(k, v);
 
-    const pub = this.canSpeak && this.local.size ? await this.ensurePub() : null;
+    if (this.canSpeak) this.direct?.setSources(this.local);
+    this.syncDirect();
+    const pub = this.canSpeak && this.local.size && this.sfuWanted() ? await this.ensurePub() : null;
     if (pub) {
       await pub.publish(this.items());
       this.assertOpen();
@@ -215,6 +263,7 @@ export class SfuCall {
       muted: this.flags.muted || !this.canSpeak,
       deafened: this.flags.deafened,
       quality: this.q,
+      ...(this.directAllowed() ? { p2p: 1 as const } : {}),
     };
   }
 
@@ -268,6 +317,7 @@ export class SfuCall {
     }
     this.ev.roster(this.others);
     for (const id of [...this.loudAt.keys()]) if (!this.others.some((o) => o.userId === id)) this.loudAt.delete(id);
+    this.syncDirect();
     this.syncSub();
   }
 
@@ -278,7 +328,8 @@ export class SfuCall {
    */
   private syncSub() {
     if (this.closed) return;
-    const want = desiredTracks(this.others);
+    // Собеседник, с которым есть прямое соединение, через SFU не принимается
+    const want = desiredTracks(this.others.filter((o) => !this.coveredByDirect(o)));
     if (want.length === 0) {
       if (this.sub?.pc) this.dropSub();
       return;
@@ -298,7 +349,7 @@ export class SfuCall {
     if (this.pub) return this.pub;
     if (!this.canSpeak) return null;
     this.pubPending ??= (async () => {
-      let grant = this.pubGrant;
+      let grant = Date.now() - this.grantAt < GRANT_MAX_AGE_MS ? this.pubGrant : null;
       this.pubGrant = null;
       if (!grant) {
         const res = await this.deps.api.join(this.target, 'pub');
@@ -319,7 +370,7 @@ export class SfuCall {
   private async ensureSub(): Promise<Subscriber | null> {
     if (this.sub) return this.sub;
     this.subPending ??= (async () => {
-      let grant = this.subGrant;
+      let grant = Date.now() - this.grantAt < GRANT_MAX_AGE_MS ? this.subGrant : null;
       this.subGrant = null;
       if (!grant) {
         const res = await this.deps.api.join(this.target, 'sub');
@@ -331,7 +382,7 @@ export class SfuCall {
       if (!grant) return null;
       const s = this.makeSubscriber(grant);
       this.sub = s;
-      s.setDesired(desiredTracks(this.others));
+      s.setDesired(desiredTracks(this.others.filter((o) => !this.coveredByDirect(o))));
       return s;
     })().finally(() => {
       this.subPending = null;
@@ -352,6 +403,8 @@ export class SfuCall {
     const old = this.sub;
     if (!old) return;
     this.sub = null;
+    // Треки закрытой сессии приёма больше не действуют (новая сессия пришлёт свои)
+    this.sfuTracks.clear();
     if (old.pc) this.forget(old.pc);
     const mids = old.close();
     if (mids.length) void this.deps.api.close(null, { session: old.session, mids }).catch(() => undefined);
@@ -362,6 +415,7 @@ export class SfuCall {
     if (t) clearTimeout(t);
     this.discTimers.delete(pc);
     this.counters.delete(pc);
+    this.bytes.delete(pc);
   }
 
   // ---------- соединения ----------
@@ -400,10 +454,10 @@ export class SfuCall {
   private makeSubscriber(grant: SessionGrant): Subscriber {
     const s = new Subscriber(this.deps.api, grant, this.config, this.pcFactory, {
       onTrack: (ref, track) => {
-        if (this.sub === s && !this.closed) this.ev.track(ref.userId, ref.source, track);
+        if (this.sub === s && !this.closed) this.setTrack('sfu', ref.userId, ref.source, track);
       },
       onTrackGone: (ref) => {
-        if (!this.closed) this.ev.track(ref.userId, ref.source, null);
+        if (!this.closed) this.setTrack('sfu', ref.userId, ref.source, null);
       },
       onError: (e) => {
         if (this.sub !== s || this.closed) return;
@@ -500,7 +554,7 @@ export class SfuCall {
         }
         this.pushPresence();
       }
-      if (scopes.has('sub') && desiredTracks(this.others).length) await this.ensureSub();
+      if (scopes.has('sub') && desiredTracks(this.others.filter((o) => !this.coveredByDirect(o))).length) await this.ensureSub();
     } catch (e) {
       for (const sc of scopes) this.pending.add(sc);
       throw e;
@@ -515,9 +569,10 @@ export class SfuCall {
       else this.local.delete(k);
     }
     if (!this.canSpeak || this.closed) return;
+    this.direct?.setSources(this.local);
     let pub: Publisher | null = this.pub;
     try {
-      if (this.local.size === 0) {
+      if (this.local.size === 0 || !this.sfuWanted()) {
         // Последний трек: соединение без медиалиний Cloudflare закрывает — закрываем сессию сами
         if (this.pub) {
           this.dropPub();
@@ -570,12 +625,16 @@ export class SfuCall {
 
   // ---------- индикаторы ----------
   private pollSpeaking() {
-    if (!this.sub) return;
+    const mics: { userId: string; receiver: RTCRtpReceiver }[] = [];
+    if (this.sub) for (const { ref, receiver } of this.sub.receivers()) if (ref.source === 'mic') mics.push({ userId: ref.userId, receiver });
+    const peer = this.directPeerId();
+    if (this.direct && peer) for (const r of this.direct.remoteReceivers()) if (r.source === 'mic') mics.push({ userId: peer, receiver: r.receiver });
+    if (!mics.length && !this.speakingNow.size) return;
     const now = Date.now();
     // Cloudflare SFU не пересылает расширение RTP с уровнем звука, поэтому основной источник —
     // уровень самого принятого звука (Web Audio); уровень из RTP учитывается, если он всё же есть.
-    for (const { ref, receiver } of this.sub.receivers()) {
-      if (ref.source !== 'mic') continue;
+    for (const { userId, receiver } of mics) {
+      const ref = { userId };
       let level = this.deps.level?.(ref.userId) ?? 0;
       try {
         for (const s of receiver.getSynchronizationSources()) level = Math.max(level, s.audioLevel ?? 0);
@@ -593,19 +652,43 @@ export class SfuCall {
   }
 
   private async pollStats() {
-    const pcs = [this.pub?.pc, this.sub?.pc].filter((p): p is RTCPeerConnection => !!p);
+    const direct = this.direct;
+    const pcs: [RTCPeerConnection, 'sfu' | 'direct'][] = [];
+    if (this.pub?.pc) pcs.push([this.pub.pc, 'sfu']);
+    if (this.sub?.pc) pcs.push([this.sub.pc, 'sfu']);
+    if (direct) pcs.push([direct.pc, 'direct']);
     const list: Quality[] = [];
-    for (const pc of pcs) {
+    let directKind: 'p2p' | 'relay' | null = null;
+    for (const [pc, via] of pcs) {
       try {
-        const report = await pc.getStats();
-        const cur = countersFromStats([...report.values()] as Record<string, unknown>[]);
-        list.push(qualityFrom(this.counters.get(pc) ?? null, cur, pc.connectionState === 'connected'));
+        const values = [...(await pc.getStats()).values()] as Record<string, unknown>[];
+        const cur = countersFromStats(values);
+        const snap = snapshotFromStats(values);
+        if (via === 'direct') {
+          if (direct?.connected) {
+            directKind = snap.kind === 'relay' ? 'relay' : 'p2p';
+            // Качество прямого соединения учитывается, только когда оно действительно несёт звук
+            list.push(qualityFrom(this.counters.get(pc) ?? null, cur, pc.connectionState === 'connected'));
+          }
+        } else {
+          list.push(qualityFrom(this.counters.get(pc) ?? null, cur, pc.connectionState === 'connected'));
+        }
         this.counters.set(pc, cur);
+        // Реально переданные байты (транспорт DTLS/ICE) — приращение с прошлого опроса
+        const prev = this.bytes.get(pc) ?? { sent: 0, received: 0 };
+        const ds = Math.max(0, snap.bytesSent - prev.sent);
+        const dr = Math.max(0, snap.bytesReceived - prev.received);
+        this.bytes.set(pc, { sent: snap.bytesSent, received: snap.bytesReceived });
+        if ((ds || dr) && this.deps.traffic) {
+          const kind: TrafficKind = via === 'sfu' ? 'sfu' : snap.kind === 'relay' ? 'relay' : 'p2p';
+          this.deps.traffic(kind, ds, dr);
+        }
       } catch {
         /* соединение закрыто */
       }
     }
     if (this.closed) return;
+    this.setTransport(directKind ?? (this.pub || this.sub?.pc ? 'sfu' : this.directState === 'trying' ? 'pending' : this.others.length ? 'sfu' : null));
     const q = list.length ? worst(list) : 'unknown';
     if (q !== this.q) {
       this.q = q;
@@ -621,6 +704,204 @@ export class SfuCall {
     for (const [scope, pc] of [['pub', this.pub?.pc], ['sub', this.sub?.pc]] as const) {
       if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) this.recover(scope);
     }
+    this.direct?.restartIce();
+    // После смены сети прямой путь мог стать возможным — пробуем снова (SFU остаётся, пока не получится)
+    if (this.failedFor) {
+      this.failedFor = null;
+      if (this.directState === 'failed') this.directState = 'idle';
+      this.syncDirect();
+    }
+  }
+
+  // ---------- прямое соединение ----------
+  private hasTurn(): boolean {
+    return (this.config.iceServers ?? []).some((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => /^turns?:/i.test(u)));
+  }
+
+  /** Прямое соединение возможно и разрешено (только личный звонок) */
+  directAllowed(): boolean {
+    const d = this.deps.direct;
+    if (this.target.kind !== 'dm' || !d?.allowed || !this.canSpeak) return false;
+    return !d.relayOnly || this.hasTurn();
+  }
+
+  private memberKey(o: RoomMember): string {
+    return `${o.userId}:${o.session}`;
+  }
+
+  private directPeerId(): string | null {
+    return this.directKey ? this.directKey.slice(0, this.directKey.indexOf(':')) : null;
+  }
+
+  private coveredByDirect(o: RoomMember): boolean {
+    return !!this.direct?.connected && this.directKey === this.memberKey(o);
+  }
+
+  /** Нужна ли публикация в SFU: собеседник без P2P, прямое соединение не удалось или ещё восстанавливается */
+  private sfuWanted(): boolean {
+    if (!this.directAllowed()) return true;
+    if (this.others.length === 0) return false;
+    if (this.others.some((o) => !o.p2p)) return true;
+    if (this.directState === 'failed') return true;
+    return this.sfuHold && this.directState !== 'connected';
+  }
+
+  private syncSfu() {
+    if (this.closed) return;
+    void this.setSources({}).catch(() => undefined);
+  }
+
+  private syncDirect() {
+    if (this.closed) return;
+    const peer = this.directAllowed() ? this.others.find((o) => o.p2p) : undefined;
+    const key = peer ? this.memberKey(peer) : null;
+    if (this.direct && this.directKey !== key) this.closeDirect(true);
+    if (!peer || !key) {
+      this.directState = 'idle';
+      this.directKey = null;
+      return;
+    }
+    if (this.failedFor === key) {
+      this.directState = 'failed';
+      this.directKey = key;
+      return;
+    }
+    if (this.direct) return;
+    this.openDirect(peer, key);
+  }
+
+  private openDirect(peer: RoomMember, key: string) {
+    const relayOnly = !!this.deps.direct?.relayOnly;
+    const link: DirectMedia = new DirectMedia({
+      // Роли «вежливой» и «невежливой» стороны однозначно задаются идентификаторами устройств
+      polite: this.session < peer.session,
+      config: { ...this.config, iceTransportPolicy: relayOnly ? 'relay' : 'all' },
+      pcFactory: this.pcFactory,
+      log: this.deps.log,
+      send: (m) => {
+        this.channel?.send(DIRECT_SIGNAL, { ...m, from: this.userId, fromDev: this.session, to: peer.userId, toDev: peer.session });
+      },
+      onState: (st) => {
+        if (this.direct === link) this.onDirectState(st);
+      },
+      onTrack: (source, track) => {
+        if (this.direct === link || !track) this.setTrack('direct', peer.userId, source, track);
+      },
+    });
+    this.direct = link;
+    this.directKey = key;
+    this.directState = 'trying';
+    this.deps.log?.(`direct: trying ${key}`);
+    if (this.canSpeak) link.setSources(this.local);
+    // Сигналы, пришедшие раньше, чем мы увидели собеседника в комнате
+    const now = Date.now();
+    const pending = this.pendingSignals.filter((p) => p.key === key && now - p.at < 15_000);
+    this.pendingSignals = this.pendingSignals.filter((p) => p.key !== key);
+    for (const p of pending) link.handle(p.msg);
+    if (this.directTimer) clearTimeout(this.directTimer);
+    this.directTimer = setTimeout(() => {
+      this.directTimer = null;
+      if (this.direct === link && !link.connected) this.failDirect('timeout');
+    }, DIRECT_TIMEOUT_MS);
+    this.setTransport('pending');
+  }
+
+  private onDirectState(st: DirectState) {
+    if (st === 'connected') {
+      if (this.directTimer) clearTimeout(this.directTimer);
+      this.directTimer = null;
+      this.directState = 'connected';
+      this.sfuHold = false;
+      this.deps.log?.('direct: connected');
+      // Прямой путь работает — SFU больше не нужен: подписка и публикация снимаются
+      this.syncSub();
+      this.syncSfu();
+      void this.pollStats();
+    } else if (st === 'failed') {
+      this.failDirect('connection lost');
+    }
+  }
+
+  private failDirect(reason: string) {
+    if (this.closed) return;
+    this.deps.log?.(`direct: fallback to SFU (${reason})`);
+    const key = this.directKey;
+    this.closeDirect(true);
+    this.failedFor = key;
+    this.directKey = key;
+    this.sfuHold = true;
+    this.directState = 'failed';
+    this.syncSfu();
+    this.syncSub();
+    this.setTransport('sfu');
+  }
+
+  private closeDirect(notify: boolean) {
+    const link = this.direct;
+    this.direct = null;
+    if (this.directTimer) clearTimeout(this.directTimer);
+    this.directTimer = null;
+    if (link) {
+      this.forget(link.pc);
+      link.close(notify);
+    }
+    for (const k of [...this.directTracks.keys()]) {
+      const i = k.lastIndexOf(':');
+      this.setTrack('direct', k.slice(0, i), k.slice(i + 1) as Source, null);
+    }
+  }
+
+  private onDirectSignal(payload: unknown) {
+    if (this.closed) return;
+    const p = payload as (MediaSignal & { from?: unknown; fromDev?: unknown; to?: unknown; toDev?: unknown }) | null;
+    if (!p || p.to !== this.userId || p.toDev !== this.session || typeof p.from !== 'string' || typeof p.fromDev !== 'string') return;
+    const key = `${p.from}:${p.fromDev}`;
+    const msg: MediaSignal = {};
+    if (p.sdp) msg.sdp = p.sdp;
+    if (p.map) msg.map = p.map;
+    if (p.cand !== undefined) msg.cand = p.cand;
+    if (p.bye === true) msg.bye = true;
+    if (this.direct && this.directKey === key) {
+      this.direct.handle(msg);
+      return;
+    }
+    if (msg.bye) {
+      // Собеседник отказался от прямого соединения (не смог установить) — тоже переходим на SFU
+      if (this.failedFor === key) return;
+      this.pendingSignals = this.pendingSignals.filter((x) => x.key !== key);
+      if (this.others.some((o) => this.memberKey(o) === key)) {
+        this.failedFor = key;
+        this.directKey = key;
+        this.sfuHold = true;
+        this.directState = 'failed';
+        this.syncSfu();
+      }
+      return;
+    }
+    this.pendingSignals.push({ key, at: Date.now(), msg });
+    if (this.pendingSignals.length > 100) this.pendingSignals.splice(0, this.pendingSignals.length - 100);
+  }
+
+  /** Трек собеседника: прямой путь имеет приоритет над SFU, наружу сообщается только изменение */
+  private setTrack(via: 'sfu' | 'direct', userId: string, source: Source, track: MediaStreamTrack | null) {
+    const key = `${userId}:${source}`;
+    const map = via === 'sfu' ? this.sfuTracks : this.directTracks;
+    if (track) map.set(key, track);
+    else map.delete(key);
+    const eff = this.directTracks.get(key) ?? this.sfuTracks.get(key) ?? null;
+    if ((this.emitted.get(key) ?? null) === eff) return;
+    this.emitted.set(key, eff);
+    if (!this.closed) this.ev.track(userId, source, eff);
+  }
+
+  private setTransport(t: CallTransport | null) {
+    if (t === this.transportNow) return;
+    this.transportNow = t;
+    this.ev.transport?.(t);
+  }
+
+  get transport(): CallTransport | null {
+    return this.transportNow;
   }
 
   // ---------- выход ----------
@@ -635,6 +916,7 @@ export class SfuCall {
     this.discTimers.clear();
     if (this.recoverTimer) clearTimeout(this.recoverTimer);
     this.offOnline?.();
+    this.closeDirect(true);
     for (const w of this.syncWaiters.splice(0)) w();
     const pub = this.pub;
     const sub = this.sub;

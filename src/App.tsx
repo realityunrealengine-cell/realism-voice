@@ -10,6 +10,7 @@ import { useConnectivity } from '@/stores/connectivity';
 import { subscribeTransferEvents } from '@/stores/transfers';
 import type { DeepLink } from '../electron/shared';
 import { AuthScreen } from '@/components/auth/AuthScreen';
+import { MfaScreen } from '@/components/auth/MfaScreen';
 import { AppShell } from '@/components/layout/AppShell';
 import { Backdrop } from '@/components/layout/Backdrop';
 import { TitleBar } from '@/components/layout/TitleBar';
@@ -125,6 +126,7 @@ export default function App() {
     content = (
       <SetupRequired message="Приложение подключилось к Supabase, но таблицы Realism Voice ещё не созданы (или профиль не найден). Примените SQL-миграции." />
     );
+  else if (status === 'mfa') content = <MfaScreen />;
   else if (status === 'signedIn' && profile) content = <AppShell />;
   else if (status === 'signedIn') content = <Splash />;
   else content = <AuthScreen />;

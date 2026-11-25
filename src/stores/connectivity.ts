@@ -107,6 +107,7 @@ export const useConnectivity = create<ConnectivityState>((set, get) => ({
       usePresence.getState().verify(true);
       // Голосовую связь трогаем только если её комната действительно разорвана
       useVoice.getState().onConnectivityRestored();
+      void import('@/lib/p2p/integration').then((m) => m.p2p.onConnectivityRestored());
     })().finally(() => {
       recovering = null;
     });

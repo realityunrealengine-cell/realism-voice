@@ -10,6 +10,9 @@ import { useAuth } from './auth';
 import { useProfiles } from './profiles';
 import { useTransfers } from './transfers';
 import { toast } from './ui';
+import { useSettings } from './settings';
+import { jsonBytes, useNetStats } from './netStats';
+import { p2p, p2pMessagesEnabled } from '@/lib/p2p/integration';
 
 const PAGE = 50;
 
@@ -89,7 +92,8 @@ function mergeSorted(existing: Message[], incoming: Message[]): Message[] {
   const map = new Map(existing.map((m) => [m.id, m]));
   for (const m of incoming) {
     const prev = map.get(m.id);
-    map.set(m.id, prev && !m._status ? { ...prev, ...m, _status: undefined, _error: undefined } : m);
+    // Версия с сервера заменяет P2P-копию с тем же id (сообщение ушло через сервер после неудачи P2P)
+    map.set(m.id, prev && !m._status ? { ...prev, ...m, _status: undefined, _error: undefined, _via: m._via, _delivery: m._delivery } : m);
   }
   return [...map.values()].sort((a, b) => a.created_at.localeCompare(b.created_at));
 }
@@ -180,20 +184,18 @@ export const useMessages = create<MessagesState>((set, get) => {
 
   const insertRow = async (scope: Scope, msg: Message, attachments: Attachment[]) => {
     const uid = useAuth.getState().userId!;
-    const { data, error } = await supabase
-      .from('messages')
-      .insert({
-        id: msg.id,
-        channel_id: scope.kind === 'channel' ? scope.id : null,
-        dm_id: scope.kind === 'dm' ? scope.id : null,
-        author_id: uid,
-        kind: msg.kind,
-        content: msg.content,
-        reply_to_id: msg.reply_to_id,
-        attachments,
-      })
-      .select('*')
-      .single();
+    const row = {
+      id: msg.id,
+      channel_id: scope.kind === 'channel' ? scope.id : null,
+      dm_id: scope.kind === 'dm' ? scope.id : null,
+      author_id: uid,
+      kind: msg.kind,
+      content: msg.content,
+      reply_to_id: msg.reply_to_id,
+      attachments,
+    };
+    useNetStats.getState().add('serverMsg', jsonBytes(row), 0);
+    const { data, error } = await supabase.from('messages').insert(row).select('*').single();
     if (error) throw new Error(errorMessage(error));
     get().applyRemote(data as Message);
   };
@@ -276,10 +278,14 @@ export const useMessages = create<MessagesState>((set, get) => {
         return;
       }
       const rows = ((data ?? []) as Message[]).map(normalize).reverse();
+      useNetStats.getState().add('serverMsg', 0, jsonBytes(data));
       useProfiles.getState().ensure(rows.map((m) => m.author_id));
+      // P2P-история хранится только на устройствах — добавляется к сообщениям с сервера
+      const local = scope.kind === 'dm' ? await p2p.history(scope.id) : [];
+      const serverIds = new Set(rows.map((r) => r.id));
       const existing = get().byScope[scope.id]?.messages ?? [];
       patchScope(scope.id, {
-        messages: mergeSorted(existing, rows),
+        messages: mergeSorted(mergeSorted(existing, local.filter((m) => !serverIds.has(m.id))), rows),
         hasMore: rows.length === PAGE,
         loading: false,
         loaded: true,
@@ -334,6 +340,24 @@ export const useMessages = create<MessagesState>((set, get) => {
       if (!text && items.length === 0 && kind === 'default') return;
       if (text.length > 4000) throw new Error('Сообщение длиннее 4000 символов');
       const id = crypto.randomUUID();
+      // Личные сообщения без вложений — напрямую (P2P), если это разрешено режимом доставки
+      if (scope.kind === 'dm' && kind === 'default' && useSettings.getState().prefs.messageMode === 'p2p' && items.length > 0) {
+        toast.error('Файлы не отправлены', 'В режиме «Только P2P» отправляется только текст. Файлы хранятся на сервере — смените режим в настройках «Сеть и P2P».');
+        return;
+      }
+      if (scope.kind === 'dm' && kind === 'default' && items.length === 0 && p2pMessagesEnabled()) {
+        const created = new Date().toISOString();
+        const outcome = await p2p.send(scope.id, { id, content: text, reply_to_id: replyTo, created_at: created }).catch((e) => {
+          console.warn('p2p send failed', e);
+          return 'server' as const;
+        });
+        if (outcome === 'p2p' || outcome === 'queued') return;
+        if (outcome === 'fallback') {
+          // P2P не подтвердил доставку — то же сообщение (тот же id) уходит через сервер
+          const cur0 = get().byScope[scope.id];
+          if (cur0) patchScope(scope.id, { messages: cur0.messages.filter((m) => m.id !== id) });
+        }
+      }
       const tasks: ItemTask[] = items.map((item) => ({ id: crypto.randomUUID(), item }));
       const msg: Message = {
         id,
@@ -427,11 +451,22 @@ export const useMessages = create<MessagesState>((set, get) => {
     },
 
     edit: async (messageId, content) => {
+      const p2pMsg = Object.values(get().byScope)
+        .flatMap((x) => x.messages)
+        .find((m) => m.id === messageId && m._via === 'p2p');
+      if (p2pMsg?.dm_id) {
+        await p2p.edit(p2pMsg.dm_id, messageId, content);
+        return;
+      }
       const { error } = await supabase.rpc('edit_message', { p_message: messageId, p_content: content });
       if (error) throw new Error(errorMessage(error));
     },
 
     remove: async (message) => {
+      if (message._via === 'p2p' && message.dm_id) {
+        await p2p.remove(message.dm_id, message.id);
+        return;
+      }
       const uid = useAuth.getState().userId;
       const paths = message.attachments.map((a) => a.path).filter(Boolean);
       const { error } = await supabase.rpc('delete_message', { p_message: message.id });
@@ -447,6 +482,10 @@ export const useMessages = create<MessagesState>((set, get) => {
       const uid = useAuth.getState().userId;
       if (!uid) return;
       const mine = (message.reactions[emoji] ?? []).includes(uid);
+      if (message._via === 'p2p' && message.dm_id) {
+        await p2p.react(message.dm_id, message.id, emoji, !mine);
+        return;
+      }
       // Оптимистично
       const users = message.reactions[emoji] ?? [];
       const nextUsers = mine ? users.filter((u) => u !== uid) : [...users, uid];

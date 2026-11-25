@@ -14,7 +14,8 @@ import type { LiveParticipant } from '@/lib/voiceRoster';
 import { voiceApi } from '@/lib/sfu/api';
 import { voiceRealtime } from '@/lib/sfu/realtime';
 import { AudioOut } from '@/lib/sfu/audioOut';
-import { RoomFullError, SfuCall, type CallDeps } from '@/lib/sfu/call';
+import { RoomFullError, SfuCall, type CallDeps, type CallTransport } from '@/lib/sfu/call';
+import { useNetStats } from './netStats';
 import { ClosedError } from '@/lib/sfu/peer';
 import type { Quality, RoomMember, Source } from '@/lib/sfu/protocol';
 import { useSettings } from './settings';
@@ -63,6 +64,8 @@ interface VoiceState {
   connectedAt: number | null;
   /** Номер попытки восстановления (для интерфейса) */
   reconnectAttempt: number;
+  /** Путь медиа: p2p — напрямую, relay — через TURN, sfu — через сервер Cloudflare, pending — устанавливается */
+  transport: CallTransport | null;
   join: (target: VoiceTarget) => Promise<void>;
   leave: () => Promise<void>;
   retry: () => Promise<void>;
@@ -85,6 +88,9 @@ export const voiceDeps: { make: (target: VoiceTarget, userId: string, session: s
     rt: voiceRealtime(),
     log: (m) => import.meta.env.DEV && console.debug('[voice]', m),
     level: (userId) => out?.level(`${userId}:mic`) ?? null,
+    direct: { allowed: useSettings.getState().prefs.callP2p, relayOnly: useSettings.getState().prefs.p2pRelayOnly },
+    traffic: (kind, sent, received) =>
+      useNetStats.getState().add(kind === 'p2p' ? 'p2pMedia' : kind === 'relay' ? 'relayMedia' : 'sfuMedia', sent, received),
   }),
   make: (target, userId, session, ev) =>
     new SfuCall(target.kind === 'channel' ? { kind: 'channel', channelId: target.channelId } : { kind: 'dm', dmId: target.dmId }, userId, session, ev, voiceDeps.deps()),
@@ -307,6 +313,7 @@ export const useVoice = create<VoiceState>((set, get) => {
   const teardown = async () => {
     const c = call;
     call = null;
+    set({ transport: null });
     knownOthers = null;
     speaking = new Set();
     remoteVideo.clear();
@@ -369,6 +376,10 @@ export const useVoice = create<VoiceState>((set, get) => {
       if (call !== h.c) return;
       set({ quality: q });
       sync();
+    },
+    transport: (t) => {
+      if (call !== h.c) return;
+      set({ transport: t });
     },
   });
 
@@ -459,6 +470,7 @@ export const useVoice = create<VoiceState>((set, get) => {
     pttPressed: false,
     connectedAt: null,
     reconnectAttempt: 0,
+    transport: null,
 
     join: async (target) => {
       const s = get();
