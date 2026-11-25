@@ -7,7 +7,7 @@
 // пока шло подключение, устаревший сеанс закрывается, а не остаётся «призраком» в канале.
 import { create } from 'zustand';
 import { supabase } from '@/lib/supabase';
-import { VoiceGate } from '@/lib/voiceGate';
+import { LocalVoiceMedia } from '@/lib/localVoiceMedia';
 import { sounds } from '@/lib/sounds';
 import { ConnectionGeneration, StaleConnectionError } from '@/lib/reconnectPolicy';
 import type { LiveParticipant } from '@/lib/voiceRoster';
@@ -95,10 +95,7 @@ const CLIENT = crypto.randomUUID();
 
 let call: SfuCall | null = null;
 let myId: string | null = null;
-let gate: VoiceGate | null = null;
-let micRaw: MediaStreamTrack | null = null;
-let cameraTrack: MediaStreamTrack | null = null;
-let screenStream: MediaStream | null = null;
+let media: LocalVoiceMedia | null = null;
 let audioCtx: AudioContext | null = null;
 let out: AudioOut | null = null;
 let lastLevelPush = 0;
@@ -106,49 +103,6 @@ let speaking = new Set<string>();
 let knownOthers: Set<string> | null = null;
 const remoteVideo = new Map<string, { camera: MediaStreamTrack | null; screen: MediaStreamTrack | null; screenAudio: boolean }>();
 const generation = new ConnectionGeneration();
-
-function micConstraints(deviceId?: string): MediaTrackConstraints {
-  const p = useSettings.getState().prefs;
-  const id = deviceId ?? p.inputDeviceId;
-  return {
-    deviceId: id && id !== 'default' ? { exact: id } : undefined,
-    echoCancellation: p.echoCancellation,
-    noiseSuppression: p.noiseSuppression,
-    autoGainControl: p.autoGainControl,
-    channelCount: 1,
-  };
-}
-
-function gateConfig() {
-  const p = useSettings.getState().prefs;
-  return {
-    mode: p.voiceMode,
-    thresholdDb: p.vadThreshold,
-    inputGain: p.inputVolume / 100,
-    pttReleaseMs: p.pttReleaseDelay,
-  } as const;
-}
-
-/** Параметры камеры и демонстрации (те же разрешения и битрейты, что были в LiveKit) */
-function cameraPreset() {
-  const q = useSettings.getState().prefs.cameraQuality;
-  return q === '1080p'
-    ? { width: 1920, height: 1080, fps: 30, bitrate: 3_000_000 }
-    : q === '480p'
-      ? { width: 960, height: 540, fps: 25, bitrate: 800_000 }
-      : { width: 1280, height: 720, fps: 30, bitrate: 1_700_000 };
-}
-
-function screenPreset() {
-  const q = useSettings.getState().prefs.screenQuality;
-  // 1440p 60 к/с: потолок битрейта с запасом для движущейся картинки; реальный битрейт подстраивается под канал
-  if (q === '1440p60') return { width: 2560, height: 1440, fps: 60, bitrate: 12_000_000 };
-  return q === '1080p60'
-    ? { width: 1920, height: 1080, fps: 30, bitrate: 5_000_000 }
-    : q === '720p'
-      ? { width: 1280, height: 720, fps: 30, bitrate: 2_000_000 }
-      : { width: 1920, height: 1080, fps: 15, bitrate: 2_500_000 };
-}
 
 function mediaErrorMessage(e: unknown): string {
   const name = (e as { name?: string })?.name;
@@ -170,21 +124,6 @@ export function liveParticipants(list: ParticipantView[]): LiveParticipant[] {
   return list.map((p) => ({ identity: p.identity, micMuted: p.micMuted, camera: !!p.camera, screen: !!p.screen, joinedAt: p.joinedAt }));
 }
 
-async function getMicTrack(): Promise<MediaStreamTrack> {
-  try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
-    return s.getAudioTracks()[0];
-  } catch (e) {
-    // Выбранный микрофон отключён — берём устройство по умолчанию
-    const name = (e as { name?: string })?.name;
-    if ((name === 'OverconstrainedError' || name === 'NotFoundError') && useSettings.getState().prefs.inputDeviceId !== 'default') {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: micConstraints('default') });
-      return s.getAudioTracks()[0];
-    }
-    throw e;
-  }
-}
-
 export const useVoice = create<VoiceState>((set, get) => {
   const sync = () => {
     const c = call;
@@ -193,7 +132,6 @@ export const useVoice = create<VoiceState>((set, get) => {
       return;
     }
     const s = get();
-    const screenVideo = screenStream?.getVideoTracks()[0] ?? null;
     const views: ParticipantView[] = [
       {
         identity: myId,
@@ -202,9 +140,9 @@ export const useVoice = create<VoiceState>((set, get) => {
         speaking: s.transmitting && !s.muted,
         micMuted: s.muted || !s.canSpeak,
         quality: s.quality,
-        camera: s.camera ? cameraTrack : null,
-        screen: s.screen ? screenVideo : null,
-        hasScreenAudio: !!screenStream?.getAudioTracks().length,
+        camera: s.camera ? media?.cameraTrack ?? null : null,
+        screen: s.screen ? media?.screenTrack ?? null : null,
+        hasScreenAudio: !!media?.hasScreenAudio,
         joinedAt: s.connectedAt,
       },
     ];
@@ -255,52 +193,16 @@ export const useVoice = create<VoiceState>((set, get) => {
     window.rv?.ptt.setActive(active);
   };
 
-  /** Микрофон: захват → шлюз VAD/PTT → постоянный трек для отправки */
-  const startMic = async (c: SfuCall): Promise<MediaStreamTrack | null> => {
-    if (!audioCtx) return null;
-    const raw = await getMicTrack();
-    const g = new VoiceGate(gateConfig());
-    g.onLevel = (db, open) => {
-      if (gate !== g) return;
-      const now = performance.now();
-      if (open !== get().transmitting) {
-        set({ transmitting: open });
-        sync();
-      }
-      if (now - lastLevelPush > 100) {
-        lastLevelPush = now;
-        set({ level: db });
-      }
-    };
-    await g.init({ track: raw, audioContext: audioCtx });
-    if (call !== c) {
-      // Сеанс уже закрыт (выход во время запроса доступа к микрофону) — ничего не оставляем открытым
-      void g.destroy();
-      raw.stop();
-      return null;
+  const onLevel = (db: number, open: boolean) => {
+    if (open !== get().transmitting) {
+      set({ transmitting: open });
+      sync();
     }
-    stopMic();
-    micRaw = raw;
-    gate = g;
-    if (g.processedTrack) g.processedTrack.enabled = !get().muted;
-    return g.processedTrack ?? null;
-  };
-
-  const stopMic = () => {
-    void gate?.destroy();
-    gate = null;
-    micRaw?.stop();
-    micRaw = null;
-  };
-
-  const stopCamera = () => {
-    cameraTrack?.stop();
-    cameraTrack = null;
-  };
-
-  const stopScreenMedia = () => {
-    screenStream?.getTracks().forEach((t) => t.stop());
-    screenStream = null;
+    const now = performance.now();
+    if (now - lastLevelPush > 100) {
+      lastLevelPush = now;
+      set({ level: db });
+    }
   };
 
   /** Полная очистка: сеанс, RTCPeerConnection, медиапотоки, воспроизведение */
@@ -311,9 +213,8 @@ export const useVoice = create<VoiceState>((set, get) => {
     speaking = new Set();
     remoteVideo.clear();
     out?.clear();
-    stopMic();
-    stopCamera();
-    stopScreenMedia();
+    media?.close();
+    media = null;
     window.rv?.ptt.setActive(false);
     await c?.close().catch(() => undefined);
   };
@@ -399,17 +300,18 @@ export const useVoice = create<VoiceState>((set, get) => {
   };
 
   const connect = async (target: VoiceTarget, gen: number) => {
-    const ensureCurrent = async () => {
+    const ensureCurrent = () => {
       if (generation.isCurrent(gen)) return;
       throw new StaleConnectionError();
     };
     const { data } = await supabase.auth.getSession();
     const userId = data.session?.user.id;
     if (!userId) throw new Error('Требуется вход в аккаунт');
-    await ensureCurrent();
+    ensureCurrent();
     myId = userId;
     audioCtx ??= new AudioContext({ latencyHint: 'interactive' });
     if (audioCtx.state === 'suspended') await audioCtx.resume().catch(() => undefined);
+    ensureCurrent();
     out ??= new AudioOut(audioCtx);
     out.setVolumes(volumeOf);
     void out.setSink(useSettings.getState().prefs.outputDeviceId).catch(() => undefined);
@@ -418,14 +320,18 @@ export const useVoice = create<VoiceState>((set, get) => {
     const c = voiceDeps.make(target, userId, CLIENT, events(holder));
     holder.c = c;
     call = c;
+    const local = new LocalVoiceMedia(audioCtx, c, onLevel);
+    media = local;
     // Сеанс сам захватывает микрофон после проверки прав (слушателю микрофон не нужен)
     await c.start(async (canSpeak) => {
-      if (!canSpeak) return {};
+      if (!canSpeak || call !== c) return {};
       try {
-        const track = await startMic(c);
+        const track = await local.startMic();
         if (call !== c) return {};
+        local.setMuted(get().muted);
         return track ? { mic: { track } } : {};
       } catch (e) {
+        if (media !== local) return {};
         toast.error('Микрофон недоступен', mediaErrorMessage(e));
         set({ muted: true });
         return {};
@@ -514,12 +420,16 @@ export const useVoice = create<VoiceState>((set, get) => {
       set({ muted, deafened: muted ? get().deafened : false });
       if (!muted) get().applyVolumes();
       muted ? sounds.mute() : sounds.unmute();
-      if (gate?.processedTrack) gate.processedTrack.enabled = !muted;
-      else if (!muted && call && get().canSpeak) {
-        const c = call;
-        void startMic(c)
-          .then((track) => (track && call === c ? c.setSources({ mic: { track } }) : undefined))
-          .catch((e) => toast.error('Микрофон недоступен', mediaErrorMessage(e)));
+      const local = media;
+      if (local?.micTrack) local.setMuted(muted);
+      else if (!muted && call && local && get().canSpeak) {
+        void local.startMic().then((track) => {
+          if (!track || media !== local) return;
+          local.setMuted(get().muted);
+          return local.publishMic(track);
+        }).catch((e) => {
+          if (media === local) toast.error('Микрофон недоступен', mediaErrorMessage(e));
+        });
       }
       call?.setFlags({ muted: muted || !get().canSpeak, deafened: get().deafened });
       sync();
@@ -530,7 +440,7 @@ export const useVoice = create<VoiceState>((set, get) => {
       const deafened = !get().deafened;
       set({ deafened, muted: deafened ? true : get().muted });
       deafened ? sounds.mute() : sounds.unmute();
-      if (deafened && gate?.processedTrack) gate.processedTrack.enabled = false;
+      if (deafened) media?.setMuted(true);
       get().applyVolumes();
       call?.setFlags({ muted: get().muted || !get().canSpeak, deafened });
       sync();
@@ -538,92 +448,41 @@ export const useVoice = create<VoiceState>((set, get) => {
     },
 
     toggleCamera: async () => {
-      const c = call;
-      if (!c) return;
-      const on = !get().camera;
+      const local = media;
+      if (!local) return;
       try {
-        if (on) {
-          if (!c.canSpeak) throw new Error('В этом канале у вас режим слушателя');
-          const preset = cameraPreset();
-          const deviceId = useSettings.getState().prefs.videoDeviceId || undefined;
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: { ideal: preset.width }, height: { ideal: preset.height }, frameRate: { ideal: preset.fps } },
-          });
-          const track = stream.getVideoTracks()[0];
-          if (call !== c) {
-            track.stop();
-            return;
-          }
-          stopCamera();
-          cameraTrack = track;
-          track.addEventListener('ended', () => {
-            if (cameraTrack === track && get().camera) void get().toggleCamera();
-          });
-          await c.setSources({ camera: { track, encoding: { maxBitrate: preset.bitrate, maxFramerate: preset.fps } } });
-          set({ camera: true });
-        } else {
-          set({ camera: false });
-          await c.setSources({ camera: null }).catch(() => undefined);
-          stopCamera();
-        }
+        if (local.cameraTrack) await local.stopCamera();
+        else await local.startCamera(() => void get().toggleCamera());
       } catch (e) {
-        toast.error('Камера недоступна', mediaErrorMessage(e));
-        await c.setSources({ camera: null }).catch(() => undefined);
-        stopCamera();
-        set({ camera: false });
+        if (media === local) toast.error('Камера недоступна', mediaErrorMessage(e));
       }
+      if (media !== local) return;
+      set({ camera: !!local.cameraTrack });
       sync();
       pushPresence();
     },
 
     startScreen: async (sourceId, withAudio) => {
-      const c = call;
-      if (!c) return;
+      const local = media;
+      if (!local) return;
       try {
-        if (!c.canSpeak) throw new Error('В этом канале у вас режим слушателя');
-        await window.rv?.screen.select(sourceId, withAudio);
-        const preset = screenPreset();
-        const stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { width: { ideal: preset.width }, height: { ideal: preset.height }, frameRate: { ideal: preset.fps, max: preset.fps } },
-          audio: withAudio ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
-        });
-        if (call !== c) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        if (screenStream) {
-          await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
-          stopScreenMedia();
-        }
-        screenStream = stream;
-        const video = stream.getVideoTracks()[0];
-        const audio = stream.getAudioTracks()[0];
-        // 60 к/с — сохраняем плавность (без подсказки 'detail', которая жертвует частотой кадров ради резкости)
-        video.contentHint = preset.fps >= 60 ? 'motion' : 'detail';
-        // Окно закрыто или демонстрацию остановила система
-        video.addEventListener('ended', () => {
-          if (screenStream === stream) void get().stopScreen();
-        });
-        await c.setSources({
-          screen: { track: video, encoding: { maxBitrate: preset.bitrate, maxFramerate: preset.fps } },
-          ...(audio ? { screenAudio: { track: audio } } : {}),
-        });
-        set({ screen: true });
+        await local.startScreen(sourceId, withAudio, () => void get().stopScreen());
       } catch (e) {
-        toast.error('Не удалось начать демонстрацию', (e as Error)?.message);
-        await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
-        stopScreenMedia();
-        set({ screen: false });
+        if (media === local) toast.error('Не удалось начать демонстрацию', (e as Error)?.message);
       }
+      if (media !== local) return;
+      set({ screen: !!local.screenTrack });
       sync();
       pushPresence();
     },
 
     stopScreen: async () => {
-      const c = call;
+      const local = media;
+      if (!local) return;
       set({ screen: false });
-      if (c) await c.setSources({ screen: null, screenAudio: null }).catch(() => undefined);
-      stopScreenMedia();
+      await local.stopScreen();
+      if (media !== local) return;
+      set({ screen: !!local.screenTrack });
       sync();
       pushPresence();
     },
@@ -631,42 +490,20 @@ export const useVoice = create<VoiceState>((set, get) => {
     setPtt: (pressed) => {
       if (get().pttPressed === pressed) return;
       set({ pttPressed: pressed });
-      gate?.setPtt(pressed);
+      media?.setPtt(pressed);
     },
 
     applyPrefs: async () => {
-      const prefs = useSettings.getState().prefs;
-      gate?.setConfig(gateConfig());
+      const local = media;
       updatePtt();
-      if (!call) return;
+      if (!local) return;
       get().applyVolumes();
-      try {
-        await out?.setSink(prefs.outputDeviceId || 'default');
-      } catch {
-        /* устройство вывода может не поддерживаться */
-      }
-      if (gate && micRaw && audioCtx) {
-        const want = micConstraints();
-        const cur = micRaw.getSettings();
-        const wantId = (want.deviceId as { exact?: string } | undefined)?.exact ?? 'default';
-        const needsRestart =
-          (wantId !== 'default' && wantId !== cur.deviceId) ||
-          cur.echoCancellation !== want.echoCancellation ||
-          cur.noiseSuppression !== want.noiseSuppression ||
-          cur.autoGainControl !== want.autoGainControl;
-        if (needsRestart) {
-          try {
-            const raw = await getMicTrack();
-            const old = micRaw;
-            // Отправляемый трек не меняется — меняется только вход шлюза, без нового согласования с SFU
-            await gate.restart({ track: raw, audioContext: audioCtx });
-            micRaw = raw;
-            old?.stop();
-          } catch (e) {
-            toast.error('Микрофон', mediaErrorMessage(e));
-          }
-        }
-      }
+      await Promise.all([
+        local.applyMicPrefs().catch((e) => {
+          if (media === local) toast.error('Микрофон', mediaErrorMessage(e));
+        }),
+        out?.setSink(useSettings.getState().prefs.outputDeviceId || 'default').catch(() => undefined),
+      ]);
     },
 
     applyVolumes: () => {

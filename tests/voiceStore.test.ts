@@ -5,20 +5,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // ---------- окружение «браузера» ----------
 const win = Object.assign(new EventTarget(), { rv: undefined as unknown });
 Object.assign(globalThis, { window: win });
-class FakeTrack {
+class FakeTrack extends EventTarget {
   readyState = 'live';
   enabled = true;
-  constructor(readonly kind: string) {}
+  constructor(readonly kind: string, readonly deviceId = 'default') { super(); }
   stop() {
     this.readyState = 'ended';
   }
   getSettings() {
-    return {};
+    return { deviceId: this.deviceId, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
   }
-  addEventListener() {}
+
 }
-const gum = vi.fn(async () => ({ getAudioTracks: () => [new FakeTrack('audio')], getVideoTracks: () => [], getTracks: () => [] }));
-Object.defineProperty(globalThis, 'navigator', { value: { onLine: true, mediaDevices: { getUserMedia: gum } }, configurable: true, writable: true });
+function stream(...tracks: FakeTrack[]) {
+  return { getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'), getVideoTracks: () => tracks.filter((t) => t.kind === 'video'), getTracks: () => tracks };
+}
+const display = vi.fn();
+const gum = vi.fn(async (_constraints?: MediaStreamConstraints) => stream(new FakeTrack('audio')));
+Object.defineProperty(globalThis, 'navigator', { value: { onLine: true, mediaDevices: { getUserMedia: gum, getDisplayMedia: display } }, configurable: true, writable: true });
 class FakeAudioContext {
   state = 'running';
   async resume() {}
@@ -78,15 +82,20 @@ vi.mock('@/lib/supabase', () => ({
 }));
 vi.mock('@/lib/sfu/realtime', () => ({ voiceRealtime: () => ({}) }));
 vi.mock('@/lib/sfu/api', () => ({ voiceApi: {} }));
+const setSink = vi.fn(async (_id: string) => {});
 vi.mock('@/lib/sfu/audioOut', () => ({
   AudioOut: class {
     setVolumes() {}
-    async setSink() {}
+    setSink = setSink;
     add() {}
     remove() {}
     clear() {}
   },
 }));
+let inputDeviceId = 'default';
+let screenQuality = '1080p';
+const restartGate = vi.fn();
+const configureGate = vi.fn();
 const gates: { destroyed: boolean; processedTrack: FakeTrack }[] = [];
 vi.mock('@/lib/voiceGate', () => ({
   VoiceGate: class {
@@ -97,10 +106,11 @@ vi.mock('@/lib/voiceGate', () => ({
       gates.push(this);
     }
     async init() {}
+    restart = restartGate;
     async destroy() {
       this.destroyed = true;
     }
-    setConfig() {}
+    setConfig = configureGate;
     setPtt() {}
   },
 }));
@@ -114,8 +124,8 @@ vi.mock('@/stores/settings', () => ({
   useSettings: {
     getState: () => ({
       prefs: {
-        inputDeviceId: 'default', echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceMode: 'vad', vadThreshold: -50,
-        inputVolume: 100, pttReleaseDelay: 200, cameraQuality: '720p', screenQuality: '1080p', outputDeviceId: 'default', userVolumes: {},
+        inputDeviceId, echoCancellation: true, noiseSuppression: true, autoGainControl: true, voiceMode: 'vad', vadThreshold: -50,
+        inputVolume: 100, pttReleaseDelay: 200, cameraQuality: '720p', screenQuality, outputDeviceId: 'default', userVolumes: {},
         outputVolume: 100, pttBinding: { code: 'KeyV', label: 'V' },
       },
       setApp: async () => undefined,
@@ -145,6 +155,10 @@ describe('голосовой стор (Cloudflare Realtime SFU)', () => {
     trackVoice.mockClear();
     sendMessage.mockClear();
     gum.mockClear();
+    display.mockReset();
+    restartGate.mockReset();
+    inputDeviceId = 'default';
+    screenQuality = '1080p';
   });
   afterEach(() => vi.useRealTimers());
 
@@ -248,6 +262,128 @@ describe('голосовой стор (Cloudflare Realtime SFU)', () => {
     useVoice.getState().toggleMute();
     expect(g.processedTrack.enabled).toBe(true);
     expect(FakeCall.all[0].flags.at(-1)).toEqual({ muted: false, deafened: false });
+  });
+
+  it('освобождает микрофон, если разрешение на захват пришло после выхода', async () => {
+    const raw = new FakeTrack('audio');
+    const pending = deferred<ReturnType<typeof stream>>();
+    gum.mockReturnValueOnce(pending.promise);
+    const joining = useVoice.getState().join(target('A'));
+    await flush();
+    expect(gum).toHaveBeenCalledTimes(1);
+    await useVoice.getState().leave();
+    pending.resolve(stream(raw));
+    await joining;
+    expect(raw.readyState).toBe('ended');
+    expect(FakeCall.all[0].provided).toEqual({});
+    expect(useVoice.getState()).toMatchObject({ status: 'idle', participants: [] });
+  });
+
+  it('меняет микрофон и возвращается на системный без повторной публикации', async () => {
+    const first = new FakeTrack('audio');
+    const second = new FakeTrack('audio', 'usb');
+    const third = new FakeTrack('audio');
+    gum.mockResolvedValueOnce(stream(first)).mockResolvedValueOnce(stream(second)).mockResolvedValueOnce(stream(third));
+    await useVoice.getState().join(target('A'));
+    const published = gates[0].processedTrack;
+    inputDeviceId = 'usb';
+    await useVoice.getState().applyPrefs();
+    expect(gum).toHaveBeenLastCalledWith({ audio: expect.objectContaining({ deviceId: { exact: 'usb' } }) });
+    expect(first.readyState).toBe('ended');
+    inputDeviceId = 'default';
+    await useVoice.getState().applyPrefs();
+    expect(restartGate.mock.calls.map(([opts]) => opts.track)).toEqual([second, third]);
+    expect(second.readyState).toBe('ended');
+    expect(third.readyState).toBe('live');
+    expect(FakeCall.all[0].provided).toEqual({ mic: { track: published } });
+    expect(FakeCall.all[0].sources).toEqual([]);
+    await useVoice.getState().leave();
+    expect(third.readyState).toBe('ended');
+  });
+
+  it('применяет настройки шлюза, пока система переключает аудиовыход', async () => {
+    await useVoice.getState().join(target('A'));
+    const switching = deferred();
+    setSink.mockReturnValueOnce(switching.promise);
+    configureGate.mockClear();
+    const applying = useVoice.getState().applyPrefs();
+    expect(configureGate).toHaveBeenCalledTimes(1);
+    switching.resolve();
+    await applying;
+  });
+
+  it('выход во время смены микрофона освобождает запоздавший трек', async () => {
+    await useVoice.getState().join(target('A'));
+    const raw = new FakeTrack('audio', 'usb');
+    const pending = deferred<ReturnType<typeof stream>>();
+    inputDeviceId = 'usb';
+    gum.mockReturnValueOnce(pending.promise);
+    const changing = useVoice.getState().applyPrefs();
+    await flush();
+    await useVoice.getState().leave();
+    pending.resolve(stream(raw));
+    await changing;
+    expect(raw.readyState).toBe('ended');
+    expect(restartGate).not.toHaveBeenCalled();
+  });
+
+  it('снимает локальную камеру с публикации, когда устройство завершает трек', async () => {
+    await useVoice.getState().join(target('A'));
+    const camera = new FakeTrack('video');
+    gum.mockResolvedValueOnce(stream(camera));
+    await useVoice.getState().toggleCamera();
+    expect(useVoice.getState().participants[0].camera).toBe(camera);
+    camera.dispatchEvent(new Event('ended'));
+    await flush();
+    expect(FakeCall.all[0].sources.at(-1)).toEqual({ camera: null });
+    expect(camera.readyState).toBe('ended');
+    expect(useVoice.getState().camera).toBe(false);
+  });
+
+  it.each(['button', 'ended'])('останавливает видео и звук демонстрации (%s)', async (how) => {
+    await useVoice.getState().join(target('A'));
+    const video = new FakeTrack('video'), audio = new FakeTrack('audio');
+    display.mockResolvedValueOnce(stream(video, audio));
+    await useVoice.getState().startScreen('display', true);
+    expect(useVoice.getState().participants[0]).toMatchObject({ screen: video, hasScreenAudio: true });
+    if (how === 'button') await useVoice.getState().stopScreen();
+    else { video.dispatchEvent(new Event('ended')); await flush(); }
+    expect(FakeCall.all[0].sources.at(-1)).toEqual({ screen: null, screenAudio: null });
+    expect([video.readyState, audio.readyState]).toEqual(['ended', 'ended']);
+    expect(useVoice.getState()).toMatchObject({ screen: false, participants: [{ screen: null, hasScreenAudio: false }] });
+  });
+
+  it('при замене экрана снимает прежнюю публикацию и применяет новые параметры кодирования', async () => {
+    await useVoice.getState().join(target('A'));
+    const first = new FakeTrack('video');
+    const second = new FakeTrack('video');
+    display.mockResolvedValueOnce(stream(first)).mockResolvedValueOnce(stream(second));
+    await useVoice.getState().startScreen('first', false);
+    screenQuality = '1440p60';
+    await useVoice.getState().startScreen('second', false);
+    expect(FakeCall.all[0].sources.slice(1)).toEqual([
+      { screen: null, screenAudio: null },
+      { screen: { track: second, encoding: { maxBitrate: 12_000_000, maxFramerate: 60 } }, screenAudio: null },
+    ]);
+    first.dispatchEvent(new Event('ended'));
+    expect(first.readyState).toBe('ended');
+    expect(second.readyState).toBe('live');
+    expect(useVoice.getState().participants[0].screen).toBe(second);
+  });
+
+  it('остановка во время выбора экрана отменяет запоздалый захват', async () => {
+    await useVoice.getState().join(target('A'));
+    const video = new FakeTrack('video'), audio = new FakeTrack('audio');
+    const pending = deferred<ReturnType<typeof stream>>();
+    display.mockReturnValueOnce(pending.promise);
+    const starting = useVoice.getState().startScreen('display', true);
+    await flush();
+    await useVoice.getState().stopScreen();
+    pending.resolve(stream(video, audio));
+    await starting;
+    expect([video.readyState, audio.readyState]).toEqual(['ended', 'ended']);
+    expect(useVoice.getState().screen).toBe(false);
+    expect(FakeCall.all[0].sources).toEqual([{ screen: null, screenAudio: null }]);
   });
 
   it('режим слушателя: микрофон не запрашивается', async () => {
